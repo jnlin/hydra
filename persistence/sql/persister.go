@@ -1,137 +1,136 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package sql
 
 import (
 	"context"
-	"database/sql"
+	"reflect"
 
-	"github.com/gobuffalo/pop/v5"
-	"github.com/gobuffalo/x/randx"
-	"github.com/pkg/errors"
+	"github.com/gofrs/uuid"
 
-	"github.com/ory/fosite"
-	"github.com/ory/fosite/storage"
-	"github.com/ory/hydra/driver/config"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/persistence"
-	"github.com/ory/hydra/x"
-	"github.com/ory/x/errorsx"
+	"github.com/ory/hydra/v2/aead"
+	"github.com/ory/hydra/v2/driver/config"
+	"github.com/ory/hydra/v2/fosite"
+	"github.com/ory/hydra/v2/internal/kratos"
+	"github.com/ory/hydra/v2/jwk"
+	"github.com/ory/hydra/v2/oauth2"
+	"github.com/ory/hydra/v2/persistence"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/logrusx"
+	"github.com/ory/x/networkx"
+	"github.com/ory/x/otelx"
 	"github.com/ory/x/popx"
 )
 
-var _ persistence.Persister = new(Persister)
-var _ storage.Transactional = new(Persister)
-
-const transactionContextKey transactionContextType = "transactionConnection"
-
 var (
-	ErrTransactionOpen   = errors.New("There is already a transaction in this context.")
-	ErrNoTransactionOpen = errors.New("There is no transaction in this context.")
+	_ persistence.Persister     = (*Persister)(nil)
+	_ fosite.ClientManager      = (*Persister)(nil)
+	_ oauth2.AssertionJWTReader = (*Persister)(nil)
+	_ x.FositeStorer            = (*Persister)(nil)
 )
 
 type (
 	Persister struct {
-		conn   *pop.Connection
-		mb     *popx.MigrationBox
-		r      Dependencies
-		config *config.Provider
-		l      *logrusx.Logger
+		*BasePersister
+		r Dependencies
+		l *logrusx.Logger
 	}
 	Dependencies interface {
 		ClientHasher() fosite.Hasher
-		KeyCipher() *jwk.AEAD
-		x.RegistryLogger
-		x.TracingProvider
+		KeyCipher() *aead.AESGCM
+		FlowCipher() *aead.XChaCha20Poly1305
+		Kratos() kratos.Client
+		contextx.Provider
+		logrusx.Provider
+		otelx.Provider
+		config.Provider
 	}
-	transactionContextType string
+	BasePersister struct {
+		c           *pop.Connection
+		fallbackNID uuid.UUID
+		d           baseDependencies
+	}
+	baseDependencies interface {
+		logrusx.Provider
+		otelx.Provider
+		contextx.Provider
+		config.Provider
+		jwk.ManagerProvider
+	}
+	BasePersisterProvider interface {
+		BasePersister() *BasePersister
+	}
 )
 
-func (p *Persister) BeginTX(ctx context.Context) (context.Context, error) {
-	_, ok := ctx.Value(transactionContextKey).(*pop.Connection)
-	if ok {
-		return ctx, errorsx.WithStack(ErrTransactionOpen)
-	}
-
-	tx, err := p.conn.Store.TransactionContextOptions(ctx, &sql.TxOptions{
-		Isolation: sql.LevelRepeatableRead,
-		ReadOnly:  false,
-	})
-	c := &pop.Connection{
-		TX:      tx,
-		Store:   tx,
-		ID:      randx.String(30),
-		Dialect: p.conn.Dialect,
-	}
-	return context.WithValue(ctx, transactionContextKey, c), err
-}
-
-func (p *Persister) Commit(ctx context.Context) error {
-	c, ok := ctx.Value(transactionContextKey).(*pop.Connection)
-	if !ok || c.TX == nil {
-		return errorsx.WithStack(ErrNoTransactionOpen)
-	}
-
-	return c.TX.Commit()
-}
-
-func (p *Persister) Rollback(ctx context.Context) error {
-	c, ok := ctx.Value(transactionContextKey).(*pop.Connection)
-	if !ok || c.TX == nil {
-		return errorsx.WithStack(ErrNoTransactionOpen)
-	}
-
-	return c.TX.Rollback()
-}
-
-func NewPersister(ctx context.Context, c *pop.Connection, r Dependencies, config *config.Provider, l *logrusx.Logger) (*Persister, error) {
-	mb, err := popx.NewMigrationBox(migrations, popx.NewMigrator(c, r.Logger(), r.Tracer(ctx), 0))
-	if err != nil {
-		return nil, errorsx.WithStack(err)
-	}
-
+func NewPersister(base *BasePersister, r Dependencies) *Persister {
 	return &Persister{
-		conn:   c,
-		mb:     mb,
-		r:      r,
-		config: config,
-		l:      l,
-	}, nil
+		BasePersister: base,
+		r:             r,
+		l:             r.Logger(),
+	}
 }
 
-func (p *Persister) Connection(ctx context.Context) *pop.Connection {
-	if c, ok := ctx.Value(transactionContextKey).(*pop.Connection); ok {
-		return c.WithContext(ctx)
-	}
-	return p.conn.WithContext(ctx)
+func NewBasePersister(c *pop.Connection, d baseDependencies) *BasePersister {
+	return &BasePersister{c: c, d: d}
 }
 
-func (p *Persister) transaction(ctx context.Context, f func(ctx context.Context, c *pop.Connection) error) error {
-	isNested := true
-	c, ok := ctx.Value(transactionContextKey).(*pop.Connection)
-	if !ok {
-		isNested = false
+func (p *BasePersister) DetermineNetwork(ctx context.Context) (*networkx.Network, error) {
+	return networkx.Determine(p.Connection(ctx))
+}
 
-		var err error
-		c, err = p.conn.WithContext(ctx).NewTransaction()
+func (p BasePersister) WithFallbackNetworkID(nid uuid.UUID) *BasePersister {
+	p.fallbackNID = nid
+	return &p
+}
 
-		if err != nil {
-			return errorsx.WithStack(err)
-		}
+func (p *BasePersister) CreateWithNetwork(ctx context.Context, v interface{}) error {
+	p.mustSetNetwork(ctx, v)
+	return p.Connection(ctx).Create(v)
+}
+
+func (p *BasePersister) UpdateWithNetwork(ctx context.Context, v interface{}) (int64, error) {
+	p.mustSetNetwork(ctx, v)
+
+	m := pop.NewModel(v, ctx)
+	cols := m.Columns()
+	cs := make([]string, 0, len(cols.Cols))
+	for _, t := range m.Columns().Cols {
+		cs = append(cs, t.Name)
 	}
 
-	if err := f(context.WithValue(ctx, transactionContextKey, c), c); err != nil {
-		if !isNested {
-			if err := c.TX.Rollback(); err != nil {
-				return errorsx.WithStack(err)
-			}
-		}
-		return err
-	}
+	return p.Connection(ctx).Where(m.IDField()+" = ? AND nid = ?", m.ID(), p.NetworkID(ctx)).UpdateQuery(v, cs...)
+}
 
-	// commit if there is no wrapping transaction
-	if !isNested {
-		return errorsx.WithStack(c.TX.Commit())
-	}
+func (p *BasePersister) NetworkID(ctx context.Context) uuid.UUID {
+	return p.d.Contextualizer().Network(ctx, p.fallbackNID)
+}
 
-	return nil
+func (p *BasePersister) QueryWithNetwork(ctx context.Context) *pop.Query {
+	return p.Connection(ctx).Where("nid = ?", p.NetworkID(ctx))
+}
+
+func (p *BasePersister) Connection(ctx context.Context) *pop.Connection {
+	return popx.GetConnection(ctx, p.c)
+}
+
+func (p *BasePersister) Ping(ctx context.Context) error { return p.c.Store.SQLDB().PingContext(ctx) }
+
+func (p *BasePersister) mustSetNetwork(ctx context.Context, v interface{}) {
+	rv := reflect.ValueOf(v)
+
+	if rv.Kind() != reflect.Pointer || (rv.Kind() == reflect.Pointer && rv.Elem().Kind() != reflect.Struct) {
+		panic("v must be a pointer to a struct")
+	}
+	nf := rv.Elem().FieldByName("NID")
+	if !nf.IsValid() || !nf.CanSet() {
+		panic("v must have settable a field 'NID uuid.UUID'")
+	}
+	nf.Set(reflect.ValueOf(p.NetworkID(ctx)))
+}
+
+func (p *BasePersister) Transaction(ctx context.Context, f func(ctx context.Context, c *pop.Connection) error) error {
+	return popx.Transaction(ctx, p.c, f)
 }

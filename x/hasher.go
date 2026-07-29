@@ -1,66 +1,69 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- *
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package x
 
 import (
 	"context"
 
-	"github.com/ory/x/errorsx"
+	"go.opentelemetry.io/otel/attribute"
 
-	"golang.org/x/crypto/bcrypt"
+	"github.com/ory/hydra/v2/fosite"
+	"github.com/ory/x/hasherx"
+	"github.com/ory/x/otelx"
 )
 
-const defaultBCryptWorkFactor = 12
+var _ fosite.Hasher = (*Hasher)(nil)
 
-// BCrypt implements a BCrypt hasher.
-type BCrypt struct {
-	c config
+// Hasher implements fosite.Hasher.
+type Hasher struct {
+	t      otelx.Provider
+	c      config
+	bcrypt *hasherx.Bcrypt
+	pbkdf2 *hasherx.PBKDF2
 }
 
 type config interface {
-	BCryptCost() int
+	hasherx.PBKDF2Configurator
+	hasherx.BCryptConfigurator
+	GetHasherAlgorithm(ctx context.Context) string
 }
 
-// NewBCrypt returns a new BCrypt instance.
-func NewBCrypt(c config) *BCrypt {
-	return &BCrypt{
-		c: c,
+// NewHasher returns a new BCrypt instance.
+func NewHasher(t otelx.Provider, c config) *Hasher {
+	return &Hasher{
+		t:      t,
+		c:      c,
+		bcrypt: hasherx.NewHasherBcrypt(c),
+		pbkdf2: hasherx.NewHasherPBKDF2(c),
 	}
 }
 
-func (b *BCrypt) Hash(ctx context.Context, data []byte) ([]byte, error) {
-	cf := b.c.BCryptCost()
-	if cf == 0 {
-		cf = defaultBCryptWorkFactor
+const (
+	hashAlgorithmBCrypt = "bcrypt"
+	hashAlgorithmPBKDF2 = "pbkdf2"
+)
+
+func (h *Hasher) Hash(ctx context.Context, data []byte) (_ []byte, err error) {
+	ctx, span := h.t.Tracer(ctx).Tracer().Start(ctx, "x.hasher.Hash")
+	defer otelx.End(span, &err)
+
+	alg := h.c.GetHasherAlgorithm(ctx)
+	span.SetAttributes(attribute.String("algorithm", alg))
+
+	switch alg {
+	case hashAlgorithmBCrypt:
+		return h.bcrypt.Generate(ctx, data)
+	case hashAlgorithmPBKDF2:
+		fallthrough
+	default:
+		return h.pbkdf2.Generate(ctx, data)
 	}
-	s, err := bcrypt.GenerateFromPassword(data, cf)
-	if err != nil {
-		return nil, errorsx.WithStack(err)
-	}
-	return s, nil
 }
 
-func (b *BCrypt) Compare(ctx context.Context, hash, data []byte) error {
-	if err := bcrypt.CompareHashAndPassword(hash, data); err != nil {
-		return errorsx.WithStack(err)
-	}
-	return nil
+func (h *Hasher) Compare(ctx context.Context, hash, data []byte) (err error) {
+	ctx, span := h.t.Tracer(ctx).Tracer().Start(ctx, "x.hasher.Compare")
+	defer otelx.End(span, &err)
+
+	return hasherx.Compare(ctx, data, hash)
 }

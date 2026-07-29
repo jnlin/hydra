@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "prettier": {
+    "proseWrap": "always",
+    "semi": false,
+    "trailingComma": "all"
+  },
+  "devDependencies": {
+    "license-checker": "^25.0.1",
+    "prettier": "3.8.1",
+    "prettier-plugin-packagejson": "2.2.18"
+  }
+}

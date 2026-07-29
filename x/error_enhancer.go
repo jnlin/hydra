@@ -1,3 +1,6 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package x
 
 import (
@@ -5,8 +8,8 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/ory/fosite"
 	"github.com/ory/herodot"
+	"github.com/ory/hydra/v2/fosite"
 )
 
 type enhancedError struct {

@@ -10,13 +10,17 @@ sudo apt-get install -y nodejs
 wget https://dl.google.com/go/go1.10.2.linux-amd64.tar.gz
 tar -C /usr/local -xzf go1.10.2.linux-amd64.tar.gz
 mkdir -p go/bin
-echo "export PATH=\$PATH:/usr/local/go/bin" >> $HOME/.profile
-echo "GOPATH=\$HOME/go" >> $HOME/.profile
-echo "export PATH=\$PATH:\$HOME/go" >> $HOME/.profile
-source $HOME/.profile
+{
+    echo "export PATH=\$PATH:/usr/local/go/bin"
+    echo "GOPATH=\$HOME/go"
+    echo "export PATH=\$PATH:\$HOME/go"
+} >> "$HOME"/.profile
+
+# shellcheck disable=SC1090,SC1091
+source "$HOME"/.profile
 
 # go/dep
-curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 
 # Docker
 sudo apt-get update
@@ -26,20 +30,19 @@ sudo apt-get -y install \
      curl \
      gnupg2 \
      software-properties-common
-curl -fsSL https://download.docker.com/linux/debian/gpg | sudo apt-key add -
+curl --retry 7 --retry-connrefused -fsSL https://download.docker.com/linux/debian/gpg | sudo apt-key add -
 sudo add-apt-repository \
    "deb [arch=amd64] https://download.docker.com/linux/debian \
    $(lsb_release -cs) \
    stable"
 sudo apt-get update
-sudo apt-get -y install docker-ce python-pip
+sudo apt-get -y install docker-ce
 
 # Dockerize
 export DOCKERIZE_VERSION=v0.6.1
 wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
     && tar -C /usr/local/bin -xzvf dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
     && rm dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz
-sudo pip install docker-compose
 
 git clone https://github.com/ory/hydra-login-consent-node.git
 
@@ -63,8 +66,8 @@ docker run -d --name kong \
     -e "KONG_DATABASE=postgres" \
     -e "KONG_PG_HOST=kong-database" \
     -e "KONG_PG_USER=kong" \
-    -e "KONG_PROXY_ACCESS_LOG=/dev/stdout" \
-    -e "KONG_ADMIN_ACCESS_LOG=/dev/stdout" \
+    -e "KONG_PROXY_request_log=/dev/stdout" \
+    -e "KONG_ADMIN_request_log=/dev/stdout" \
     -e "KONG_PROXY_ERROR_LOG=/dev/stderr" \
     -e "KONG_ADMIN_ERROR_LOG=/dev/stderr" \
     -e "KONG_ADMIN_LISTEN=0.0.0.0:8001" \

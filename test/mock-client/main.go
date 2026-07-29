@@ -1,31 +1,16 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @Copyright 	2017-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -34,17 +19,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	hydra "github.com/ory/hydra-client-go/v2"
+
 	"golang.org/x/oauth2"
 
-	hydra "github.com/ory/hydra/internal/httpclient/client"
-	"github.com/ory/hydra/internal/httpclient/client/admin"
 	"github.com/ory/x/cmdx"
 	"github.com/ory/x/urlx"
 )
 
 var hydraURL = urlx.ParseOrPanic(os.Getenv("HYDRA_ADMIN_URL"))
-var sdk = hydra.NewHTTPClientWithConfig(nil, &hydra.TransportConfig{Schemes: []string{hydraURL.Scheme}, Host: hydraURL.Host, BasePath: hydraURL.Path})
+var sdk = hydra.NewAPIClient(hydra.NewConfiguration())
+
+func init() {
+	sdk.GetConfig().Servers = hydra.ServerConfigurations{{URL: hydraURL.String()}}
+}
 
 type oauth2token struct {
 	IDToken      string    `json:"id_token"`
@@ -96,9 +84,9 @@ func main() {
 		},
 	}).Get(au)
 	cmdx.CheckResponse(err, http.StatusOK, resp)
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
-	out, err := ioutil.ReadAll(resp.Body)
+	out, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Fatalf("Unable to read body: %s", err)
 	}
@@ -130,7 +118,7 @@ func main() {
 	// refreshing the same token twice does not work
 	resp, err = refreshTokenRequest(token)
 	cmdx.CheckResponse(err, http.StatusBadRequest, resp)
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 }
 
 func refreshTokenRequest(token oauth2token) (*http.Response, error) {
@@ -147,7 +135,7 @@ func refreshTokenRequest(token oauth2token) (*http.Response, error) {
 func refreshToken(token oauth2token) (result oauth2token) {
 	resp, err := refreshTokenRequest(token)
 	cmdx.CheckResponse(err, http.StatusOK, resp)
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	err = json.NewDecoder(resp.Body).Decode(&result)
 	cmdx.Must(err, "Unable to decode refresh token: %s", err)
@@ -173,7 +161,7 @@ func checkTokenResponse(token oauth2token) {
 			log.Fatalf("JWT Access Token does not seem to have three parts: %d - %+v - %v", len(parts), token, parts)
 		}
 
-		payload, err := jwt.DecodeSegment(parts[1])
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 		if err != nil {
 			log.Fatalf("Unable to decode id token segment: %s", err)
 		}
@@ -193,22 +181,22 @@ func checkTokenResponse(token oauth2token) {
 		}
 	}
 
-	res, err := sdk.Admin.IntrospectOAuth2Token(admin.NewIntrospectOAuth2TokenParams().WithToken(token.AccessToken))
+	intro, resp, err := sdk.OAuth2API.IntrospectOAuth2Token(context.Background()).Token(token.AccessToken).Execute()
+	defer resp.Body.Close() //nolint:errcheck
 	if err != nil {
 		log.Fatalf("Unable to introspect OAuth2 token: %s", err)
 	}
-	intro := res.Payload
 
-	if !*intro.Active {
+	if !intro.Active {
 		log.Fatalf("Expected token to be active: %s", token.AccessToken)
 	}
 
-	if intro.Sub != "the-subject" {
-		log.Fatalf("Expected subject from access token to be %s but got %s", "the-subject", intro.Sub)
+	if *intro.Sub != "the-subject" {
+		log.Fatalf("Expected subject from access token to be %s but got %s", "the-subject", *intro.Sub)
 	}
 
-	if intro.Ext.(map[string]interface{})["foo"] != expectedValue {
-		log.Fatalf("Expected extra field \"foo\" from access token to be \"%s\" but got %s", expectedValue, intro.Ext.(map[string]interface{})["foo"])
+	if intro.Ext["foo"] != expectedValue {
+		log.Fatalf("Expected extra field \"foo\" from access token to be \"%s\" but got %s", expectedValue, intro.Ext["foo"])
 	}
 
 	idt := token.IDToken
@@ -221,7 +209,7 @@ func checkTokenResponse(token oauth2token) {
 		log.Fatalf("ID Token does not seem to have three parts: %d - %+v - %v", len(parts), token, parts)
 	}
 
-	payload, err := jwt.DecodeSegment(parts[1])
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		log.Fatalf("Unable to decode id token segment: %s", err)
 	}

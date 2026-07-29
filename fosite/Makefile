@@ -1,0 +1,40 @@
+export PATH 					:= .bin:${PATH}
+
+PRETTIER_VERSION=$(shell cat package.json | jq -r '.devDependencies["prettier"] // .dependencies["prettier"]')
+
+format: .bin/goimports .bin/ory node_modules  # formats the source code
+	.bin/ory dev headers copyright --type=open-source
+	.bin/goimports -w .
+	@echo "Prettier Version: $(PRETTIER_VERSION)"
+	npx --package=prettier@$(PRETTIER_VERSION)  prettier . --write
+
+help:
+	@cat Makefile | grep '^[^ ]*:' | grep -v '^\.bin/' | grep -v '.SILENT:' | grep -v '^node_modules:' | grep -v help | sed 's/:.*#/#/' | column -s "#" -t
+
+licenses: .bin/licenses node_modules  # checks open-source licenses
+	.bin/licenses
+
+test:  # runs all tests
+	go test ./...
+
+.bin/goimports: Makefile
+	GOBIN=$(shell pwd)/.bin go install golang.org/x/tools/cmd/goimports@latest
+
+.bin/licenses: Makefile
+	curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/ci/master/licenses/install | sh
+
+.bin/mockgen:
+	go build -o .bin/mockgen go.uber.org/mock/mockgen
+
+.bin/ory: Makefile
+	curl --retry 7 --retry-connrefused https://raw.githubusercontent.com/ory/meta/master/install.sh | bash -s -- -b .bin ory v0.1.48
+	touch .bin/ory
+
+node_modules: package-lock.json
+	npm ci
+	touch node_modules
+
+gen: .bin/goimports .bin/mockgen  # generates mocks
+	./generate-mocks.sh
+
+.DEFAULT_GOAL := help

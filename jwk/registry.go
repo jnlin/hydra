@@ -1,17 +1,24 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package jwk
 
 import (
-	"github.com/ory/hydra/x"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+
+	"github.com/ory/hydra/v2/driver/config"
+	"github.com/ory/hydra/v2/x"
 )
 
 type InternalRegistry interface {
-	x.RegistryWriter
-	x.RegistryLogger
+	httpx.WriterProvider
+	logrusx.Provider
 	Registry
 }
 
 type Registry interface {
-	KeyManager() Manager
-	KeyGenerators() map[string]KeyGenerator
-	KeyCipher() *AEAD
+	config.Provider
+	x.NetworkProvider
+	ManagerProvider
 }

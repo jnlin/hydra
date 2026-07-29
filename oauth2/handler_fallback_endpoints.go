@@ -1,22 +1,5 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package oauth2
 
@@ -24,12 +7,10 @@ import (
 	"html/template"
 	"net/http"
 
-	"github.com/ory/hydra/driver/config"
-
-	"github.com/julienschmidt/httprouter"
+	"github.com/ory/hydra/v2/driver/config"
 )
 
-func (h *Handler) fallbackHandler(title, heading string, sc int, configKey string) httprouter.Handle {
+func (h *Handler) fallbackHandler(title, heading string, sc int, configKey string) func(w http.ResponseWriter, r *http.Request) {
 	if title == "" {
 		title = "The request could not be executed because a mandatory configuration key is missing or malformed"
 	}
@@ -38,7 +19,7 @@ func (h *Handler) fallbackHandler(title, heading string, sc int, configKey strin
 		heading = "The request could not be executed because a mandatory configuration key is missing or malformed"
 	}
 
-	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		h.r.Logger().Errorf(`A request failed because configuration key "%s" is missing or malformed.`, configKey)
 
 		t, err := template.New(configKey).Parse(`<html>
@@ -53,7 +34,7 @@ func (h *Handler) fallbackHandler(title, heading string, sc int, configKey strin
 	You are seeing this page because configuration key <code>{{ .Key }}</code> is not set.
 </p>
 <p>
-	If you are an administrator, please read <a href="https://www.ory.sh/docs">the guide</a> to understand what you
+	If you are an administrator, please read <a href="https://www.ory.com/docs">the guide</a> to understand what you
 	need to do. If you are a user, please contact the administrator.
 </p>
 </body>
@@ -75,7 +56,7 @@ func (h *Handler) fallbackHandler(title, heading string, sc int, configKey strin
 	}
 }
 
-func (h *Handler) DefaultErrorHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (h *Handler) DefaultErrorHandler(w http.ResponseWriter, r *http.Request) {
 	h.r.Logger().WithRequest(r).Error("A client requested the default error URL, environment variable URLS_ERROR is probably not set.")
 
 	t, err := template.New("consent").Parse(`
@@ -97,7 +78,7 @@ func (h *Handler) DefaultErrorHandler(w http.ResponseWriter, r *http.Request, _ 
 	You are seeing this page because configuration key <code>{{ .Key }}</code> is not set.
 </p>
 <p>
-	If you are an administrator, please read <a href="https://www.ory.sh/docs">the guide</a> to understand what you
+	If you are an administrator, please read <a href="https://www.ory.com/docs">the guide</a> to understand what you
 	need to do. If you are a user, please contact the administrator.
 </p>
 </body>

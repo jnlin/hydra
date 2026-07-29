@@ -1,30 +1,30 @@
-// +build conformity
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build conformity
 
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/ory/hydra/internal/httpclient/client"
-	"github.com/ory/hydra/internal/httpclient/client/admin"
-	"github.com/ory/hydra/internal/httpclient/models"
-	"github.com/ory/x/pointerx"
+	backoff "github.com/cenkalti/backoff/v3"
 
-	"github.com/cenkalti/backoff/v3"
+	hydrac "github.com/ory/hydra-client-go/v2"
 
 	"github.com/ory/x/httpx"
-
-	"github.com/ory/x/stringslice"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -104,28 +104,22 @@ var (
 		{"planName": {"oidcc-formpost-basic-certification-test-plan"}, "variant": {"{\"server_metadata\":\"discovery\",\"client_registration\":\"dynamic_client\"}"}},
 	}
 	server     = urlx.ParseOrPanic("https://127.0.0.1:8443")
-	config, _  = ioutil.ReadFile("./config.json")
-	httpClient = httpx.NewResilientClient(
-		httpx.ResilientClientWithMinxRetryWait(time.Second*5),
-		httpx.ResilientClientWithClient(&http.Client{
-			Timeout: time.Second * 5,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-			},
-		}))
+	config, _  = os.ReadFile("./config.json")
+	httpClient = httpx.NewResilientClient(httpx.ResilientClientWithMinRetryWait(time.Second * 5))
+	workdir    string
 
-	workdir string
-
-	hydra = client.NewHTTPClientWithConfig(nil, &client.TransportConfig{
-		Host:     "127.0.0.1:4445",
-		BasePath: "/",
-		Schemes:  []string{"https"}})
+	hydra = hydrac.NewAPIClient(hydrac.NewConfiguration())
 )
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
+	httpClient.HTTPClient.Timeout = 15 * time.Second
+	httpClient.HTTPClient.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	hydra.GetConfig().HTTPClient = httpClient.HTTPClient
+	hydra.GetConfig().Servers = hydrac.ServerConfigurations{{URL: "https://127.0.0.1:4445"}}
 }
 
 func waitForServices(t *testing.T) {
@@ -183,25 +177,38 @@ func TestPlans(t *testing.T) {
 }
 
 func makePost(t *testing.T, href string, payload io.Reader, esc int) []byte {
-	res, err := httpClient.Post(href, "application/json", payload)
-	require.NoError(t, err)
-	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
-	require.NoError(t, err)
-	require.Equal(t, esc, res.StatusCode, "%s\n%s", href, body)
+	t.Helper()
+	body, err := makePostErr(href, payload, esc)
+	require.NoErrorf(t, err, "Failed to make POST request. Check that the server is live and that the certificate in test/conformance/ssl is not expired.")
 	return body
+}
+
+func makePostErr(href string, payload io.Reader, esc int) ([]byte, error) {
+	res, err := httpClient.Post(href, "application/json", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make POST request: %w\nURL: %s", err, href)
+	}
+	defer res.Body.Close() //nolint:errcheck
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read POST response body: %w\nURL: %s", err, href)
+	}
+	if res.StatusCode != esc {
+		return nil, fmt.Errorf("expected POST status %d, got %d\nURL: %s\n%s", esc, res.StatusCode, href, body)
+	}
+	return body, nil
 }
 
 func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 	planName := extra.Get("planName")
-	if stringslice.Has(skipWhenShort, planName) && testing.Short() {
+	if slices.Contains(skipWhenShort, planName) && testing.Short() {
 		t.Skipf("Skipping test plan '%s' because short tests", planName)
 		return
 	}
 
 	// https://localhost:8443/api/plan?planName=oidcc-formpost-basic-certification-test-plan&variant={"server_metadata":"discovery","client_registration":"dynamic_client"}&variant={"server_metadata":"discovery","client_registration":"dynamic_client"}
-	//planConfig, err := sjson.SetBytes(config, "alias", uuid.New())
-	//require.NoError(t, err)
+	// planConfig, err := sjson.SetBytes(config, "alias", uuid.New())
+	// require.NoError(t, err)
 	body := makePost(t, urlx.CopyWithQuery(urlx.AppendPaths(server, "/api/plan"), extra).String(),
 		bytes.NewReader(config),
 		201)
@@ -223,19 +230,25 @@ func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 				t.Skipf("Test module 'oidcc-server-rotate-keys' can not run in parallel tests and was skipped...")
 				return
 			} else if module != "oidcc-server-rotate-keys" && !isParallel {
-				t.Skipf("Without paralleism only test module 'oidcc-server-rotate-keys' will be executed.")
+				t.Skipf("Without parallelism only test module 'oidcc-server-rotate-keys' will be executed.")
 				return
 			}
 
 			params := url.Values{"test": {module}, "plan": {plan}, "variant": {v.Get("variant").Raw}}
 
 			const maxRetries = 5
+		runnerRetries:
 			for retry := 1; retry <= maxRetries; retry++ {
 				time.Sleep(time.Duration(rand.Intn(5000)) * time.Millisecond)
 
 				t.Logf("Creating retry %d/%d testModule %s for plan %s with params: %+v", retry, maxRetries, module, plan, params)
-				body := makePost(t, urlx.CopyWithQuery(urlx.AppendPaths(server, "/api/runner"), params).String(),
-					nil, 201)
+				body, err := makePostErr(urlx.CopyWithQuery(urlx.AppendPaths(server, "/api/runner"), params).String(), nil, 201)
+				if err != nil {
+					t.Logf("Creating runner for testModule %s for plan %s failed. Retrying with a fresh test: %s", module, plan, err)
+					continue
+				}
+				testID := gjson.GetBytes(body, "id").String()
+				require.NotEmpty(t, testID)
 
 				conf := backoff.NewExponentialBackOff()
 				conf.MaxElapsedTime = time.Minute * 5
@@ -250,11 +263,15 @@ func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 					}
 					time.Sleep(nb)
 
-					state, passed := checkStatus(t, gjson.GetBytes(body, "id").String())
+					state, passed, err := checkStatus(t, testID)
+					if err != nil {
+						t.Logf("Checking status for testModule %s for plan %s failed. Continuing to poll: %s", module, plan, err)
+						continue
+					}
 					switch passed {
 					case statusRetry:
 						t.Logf("Status from testModule %s for plan %s with params marked the test for retry. Retrying with a fresh test...", module, plan)
-						break
+						continue runnerRetries
 					case statusFailed:
 						panic("This statement should never be reached")
 					case statusSuccess:
@@ -276,9 +293,9 @@ func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 								bo := conf.NextBackOff()
 								require.NotEqual(t, backoff.Stop, bo, "%+v", err)
 
-								_, err = hydra.Admin.CreateJSONWebKeySet(admin.NewCreateJSONWebKeySetParams().WithHTTPClient(httpClient.StandardClient()).WithSet("hydra.openid.id-token").WithBody(&models.JSONWebKeySetGeneratorRequest{
-									Alg: pointerx.String("RS256"),
-								}))
+								_, _, err = hydra.JwkAPI.CreateJsonWebKeySet(context.Background(), "hydra.openid.id-token").CreateJsonWebKeySet(hydrac.CreateJsonWebKeySet{
+									Alg: "RS256",
+								}).Execute()
 								if err == nil {
 									break
 								}
@@ -286,7 +303,7 @@ func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 								time.Sleep(bo)
 							}
 
-							makePost(t, urlx.AppendPaths(server, "/api/runner/", gjson.GetBytes(body, "id").String()).String(), nil, 200)
+							makePost(t, urlx.AppendPaths(server, "/api/runner/", testID).String(), nil, 200)
 						}
 					}
 				}
@@ -298,33 +315,39 @@ func createPlan(t *testing.T, extra url.Values, isParallel bool) {
 	})
 }
 
-func checkStatus(t *testing.T, testID string) (string, status) {
+func checkStatus(t *testing.T, testID string) (string, status, error) {
 	res, err := httpClient.Get(urlx.AppendPaths(server, "/api/info", testID).String())
-	require.NoError(t, err)
-	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
-	require.NoError(t, err)
-	require.Equal(t, 200, res.StatusCode, "%s", body)
+	if err != nil {
+		return "", statusRunning, fmt.Errorf("failed to make info request for test %s: %w", testID, err)
+	}
+	defer res.Body.Close() //nolint:errcheck
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", statusRunning, fmt.Errorf("failed to read info response body for test %s: %w", testID, err)
+	}
+	if res.StatusCode != 200 {
+		return "", statusRunning, fmt.Errorf("expected info status 200 for test %s, got %d: %s", testID, res.StatusCode, body)
+	}
 
 	state := gjson.GetBytes(body, "status").String()
 	t.Logf("Got status %s for %s", state, testID)
 	switch state {
 	case "INTERRUPTED":
 		t.Logf("Test was INTERRUPTED: %s", body)
-		return state, statusRetry
+		return state, statusRetry, nil
 	case "FINISHED":
 		result := gjson.GetBytes(body, "result").String()
 		t.Logf("Got result %s for %s", result, testID)
 
 		if result == "PASSED" || result == "WARNING" || result == "SKIPPED" || result == "REVIEW" {
-			return state, statusSuccess
+			return state, statusSuccess, nil
 		} else if result == "FAILED" {
 			require.FailNowf(t, "Test was FAILED", "Expected status not to be FAILED got: %s", body)
-			return state, statusFailed
+			return state, statusFailed, nil
 		}
 
 		require.FailNowf(t, "Test failed with another error", "Unexpected status: %s", body)
-		return state, statusFailed
+		return state, statusFailed, nil
 	case "CONFIGURED":
 		fallthrough
 	case "CREATED":
@@ -332,9 +355,9 @@ func checkStatus(t *testing.T, testID string) (string, status) {
 	case "RUNNING":
 		fallthrough
 	case "WAITING":
-		return state, statusRunning
+		return state, statusRunning, nil
 	}
 
 	require.FailNowf(t, "Unexpected state", "Unexpected state: %s", body)
-	return state, statusFailed
+	return state, statusFailed, nil
 }

@@ -1,169 +1,324 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package migratest
 
 import (
-	"context"
+	stdsql "database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/ory/x/configx"
-
-	"github.com/ory/hydra/persistence/sql"
-
-	"github.com/ory/x/popx"
-
-	"github.com/ory/x/sqlcon/dockertest"
-
-	"github.com/ory/hydra/driver/config"
-
-	"github.com/gobuffalo/pop/v5"
+	"github.com/bradleyjkemp/cupaloy/v2"
+	"github.com/fatih/structs"
+	"github.com/gofrs/uuid"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/consent"
-	"github.com/ory/hydra/driver"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/oauth2"
-	"github.com/ory/hydra/x"
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/consent"
+	"github.com/ory/hydra/v2/flow"
+	testhelpersuuid "github.com/ory/hydra/v2/internal/testhelpers/uuid"
+	"github.com/ory/hydra/v2/jwk"
+	"github.com/ory/hydra/v2/oauth2"
+	"github.com/ory/hydra/v2/persistence/sql"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/dbal"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/networkx"
+	"github.com/ory/x/popx"
+	"github.com/ory/x/sqlcon/dockertest"
+	"github.com/ory/x/sqlxx"
 )
 
+func snapshotFor(paths ...string) *cupaloy.Config {
+	return cupaloy.New(
+		cupaloy.CreateNewAutomatically(true),
+		cupaloy.FailOnUpdate(true),
+		cupaloy.SnapshotFileExtension(".json"),
+		cupaloy.SnapshotSubdirectory(filepath.Join(paths...)),
+	)
+}
+
+func compareWithFixture(t *testing.T, actual interface{}, prefix string, id string) {
+	s := snapshotFor("fixtures", prefix)
+	actualJSON, err := json.MarshalIndent(actual, "", "  ")
+	require.NoErrorf(t, err, "%+v", actual)
+	assert.NoError(t, s.SnapshotWithName(id, actualJSON))
+}
+
 func TestMigrations(t *testing.T) {
-	if testing.Short() {
-		t.SkipNow()
-		return
+	connections := make(map[string]*pop.Connection, 4)
+
+	{
+		c, err := pop.NewConnection(&pop.ConnectionDetails{URL: dbal.NewSQLiteTestDatabase(t)})
+		require.NoError(t, err)
+		require.NoError(t, c.Open())
+		connections["sqlite"] = c
 	}
 
-	connections := make(map[string]*pop.Connection, 3)
-	dockertest.Parallel([]func(){
-		func() {
-			connections["postgres"] = dockertest.ConnectToTestPostgreSQLPop(t)
-		},
-		func() {
-			connections["mysql"] = dockertest.ConnectToTestMySQLPop(t)
-		},
-		func() {
-			connections["cockroach"] = dockertest.ConnectToTestCockroachDBPop(t)
-		},
-	})
+	if !testing.Short() {
+		wg := sync.WaitGroup{}
+		for db, dsn := range map[string]string{
+			"postgres":  dockertest.RunTestPostgreSQL(t),
+			"mysql":     dockertest.RunTestMySQL(t),
+			"cockroach": dockertest.RunTestCockroachDBWithVersion(t, "latest-v25.4"),
+		} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				dbName := "testdb" + strings.ReplaceAll(uuid.Must(uuid.NewV4()).String(), "-", "")
+				t.Logf("using %s database %q", db, dbName)
+
+				require.EventuallyWithT(t, func(t *assert.CollectT) {
+					c, err := pop.NewConnection(&pop.ConnectionDetails{URL: dsn})
+					require.NoError(t, err)
+					require.NoError(t, c.Open())
+					require.NoError(t, c.RawQuery("CREATE DATABASE "+dbName).Exec())
+					dsn = regexp.MustCompile(`/[a-z0-9]+\?`).ReplaceAllString(dsn, "/"+dbName+"?")
+					require.NoError(t, c.Close())
+
+					c, err = pop.NewConnection(&pop.ConnectionDetails{URL: dsn})
+					require.NoError(t, err)
+					require.NoError(t, c.Open())
+					connections[db] = c
+				}, 20*time.Second, 100*time.Millisecond)
+				t.Cleanup(func() {
+					connections[db].Close() //nolint:errcheck
+				})
+			}()
+		}
+		wg.Wait()
+	}
 
 	for db, c := range connections {
-		t.Run(fmt.Sprintf("database=%s", db), func(t *testing.T) {
-			x.CleanSQLPop(t, c)
-			url := c.URL()
+		t.Run("database="+db, func(t *testing.T) {
+			t.Parallel()
 
-			// workaround for https://github.com/gobuffalo/pop/issues/538
-			if db == "mysql" {
-				url = "mysql://" + url
+			l := logrusx.New("", "", logrusx.ForceLevel(logrus.DebugLevel))
+
+			tm, err := popx.NewMigrationBox(
+				sql.Migrations,
+				c, l,
+				popx.WithTestdata(t, os.DirFS("./testdata")),
+				popx.WithoutGoldenDatabase())
+			require.NoError(t, err)
+			if !assert.NoError(t, tm.Up(t.Context())) {
+				_ = tm.DumpMigrationSchema(t.Context())
+				t.FailNow()
 			}
 
-			d := driver.New(
-				context.Background(),
-				driver.WithOptions(configx.WithValue(config.KeyDSN, url)),
-				driver.DisablePreloading(),
-				driver.DisableValidation(),
-			)
-
-			tm := popx.NewTestMigrator(t, c, "../migrations", "./testdata", d.Logger())
-			require.NoError(t, tm.Up(context.Background()))
-
-			var lastClient *client.Client
-			for i := 1; i <= 14; i++ {
-				// skip cockroach assertions until migration 13
-				if db == "cockroach" && i < 13 {
-					continue
-				}
-				t.Run(fmt.Sprintf("case=client migration %d", i), func(t *testing.T) {
-					expected := expectedClient(i)
-					actual := &client.Client{}
-					require.NoError(t, c.Where("id = ?", expected.OutfacingID).First(actual))
-					assertEqualClients(t, expected, actual)
-					lastClient = actual
-				})
-			}
-
-			for i := 1; i <= 4; i++ {
-				// skip cockroach assertions until migration 4
-				if db == "cockroach" && i < 4 {
-					continue
-				}
-				t.Run(fmt.Sprintf("case=jwk migration %d", i), func(t *testing.T) {
-					expected := expectedJWK(i)
-					actual := &jwk.SQLData{}
-					require.NoError(t, c.Where("pk = ?", expected.ID).First(actual))
-					assertEqualJWKs(t, expected, actual)
-				})
-			}
-
-			for i := 1; i <= 14; i++ {
-				if db == "cockroach" && i < 12 {
-					continue
-				}
-				t.Run(fmt.Sprintf("case=consent migration %d", i), func(t *testing.T) {
-					ecr, elr, els, ehcr, ehlr, efols, elor := expectedConsent(i)
-
-					acr, err := d.ConsentManager().GetConsentRequest(context.Background(), ecr.ID)
-					require.NoError(t, err)
-					assertEqualConsentRequests(t, ecr, acr)
-
-					alr, err := d.ConsentManager().GetLoginRequest(context.Background(), elr.ID)
-					require.NoError(t, err)
-					assertEqualLoginRequests(t, elr, alr)
-
-					als := &consent.LoginSession{}
-					require.NoError(t, c.Find(als, els.ID))
-					assertEqualLoginSessions(t, els, als)
-
-					ahcr := &consent.HandledConsentRequest{}
-					require.NoError(t, c.Q().Where("challenge = ?", ehcr.ID).First(ahcr))
-					require.NoError(t, ehcr.AfterFind(c))
-					assertEqualHandledConsentRequests(t, ehcr, ahcr)
-
-					ahlr := &consent.HandledLoginRequest{}
-					require.NoError(t, c.Q().Where("challenge = ?", ehlr.ID).First(ahlr))
-					assertEqualHandledLoginRequests(t, ehlr, ahlr)
-
-					if efols != nil {
-						afols, err := d.ConsentManager().GetForcedObfuscatedLoginSession(context.Background(), lastClient.OutfacingID, efols.SubjectObfuscated)
-						require.NoError(t, err)
-						assertEqualForcedObfucscatedLoginSessions(t, efols, afols)
-					}
-
-					if elor != nil {
-						alor := &consent.LogoutRequest{}
-						require.NoError(t, d.Persister().Connection(context.Background()).RawQuery("select * from hydra_oauth2_logout_request where challenge = ?", elor.ID).First(alor))
-						alor.Client = nil
-						assertEqualLogoutRequests(t, elor, alor)
+			t.Run("suite=fixtures", func(t *testing.T) {
+				t.Run("case=hydra_client", func(t *testing.T) {
+					cs := []client.Client{}
+					require.NoError(t, c.All(&cs))
+					require.Len(t, cs, 20)
+					for _, c := range cs {
+						if s := time.Since(c.CreatedAt); s > 0 && s < 10*time.Minute {
+							// Some are backfilled with the current time
+							assert.WithinDuration(t, c.CreatedAt, c.UpdatedAt, 5*time.Second)
+							c.CreatedAt, c.UpdatedAt = time.Time{}, time.Time{}
+						}
+						compareWithFixture(t, structs.Map(c), "hydra_client", c.ID)
 					}
 				})
-			}
 
-			// TODO https://github.com/ory/hydra/issues/1815
-			// this is very stupid and should be replaced as soon the manager uses pop
-			// necessary because the manager does not provide any way to access the data
-			for i := 1; i <= 11; i++ {
-				if db == "cockroach" && i < 9 {
-					continue
+				t.Run("case=hydra_jwk", func(t *testing.T) {
+					js := []jwk.SQLData{}
+					require.NoError(t, c.All(&js))
+					require.Len(t, js, 7)
+					for _, j := range js {
+						testhelpersuuid.AssertUUID(t, j.ID)
+						j.ID = uuid.Nil // Some IDs are generated at migration time so we zero them in the fixtures
+						if s := time.Since(j.CreatedAt); s > 0 && s < 10*time.Minute {
+							// Some are backfilled with the current time
+							j.CreatedAt = time.Time{}
+						}
+						compareWithFixture(t, j, "hydra_jwk", j.KID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_flow", func(t *testing.T) {
+					// we first load the "full" flows
+					fullFlows := []flow.Flow{}
+					require.NoError(t, c.Where("client_id IS NOT NULL").All(&fullFlows))
+					require.Len(t, fullFlows, 19)
+
+					for _, f := range fullFlows {
+						assert.NotNil(t, f.Client)
+						f.Client = nil // clients are loaded eagerly, nil them for snapshot comparison
+						compareWithFixture(t, f, "hydra_oauth2_flow", f.ID)
+					}
+
+					// then the "reduced" flows
+					reducedFlows := []flow.Flow{}
+					require.NoError(t, c.Select("login_challenge", "nid", "requested_at").Where("client_id IS NULL").All(&reducedFlows))
+					require.Len(t, reducedFlows, 1)
+
+					for _, f := range reducedFlows {
+						compareWithFixture(t, f, "hydra_oauth2_flow", f.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_authentication_session", func(t *testing.T) {
+					ss := []flow.LoginSession{}
+					require.NoError(t, c.All(&ss))
+					require.Len(t, ss, 17)
+
+					for _, s := range ss {
+						compareWithFixture(t, s, "hydra_oauth2_authentication_session", s.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_logout_request", func(t *testing.T) {
+					// Mirrors the legacy hydra_oauth2_logout_request row shape so we
+					// can continue snapshotting seeded rows until the follow-up PR
+					// drops the table. Application code no longer reads or writes
+					// here.
+					type legacyLogoutRequest struct {
+						ID                    string            `json:"challenge" db:"challenge"`
+						NID                   uuid.UUID         `json:"-" db:"nid"`
+						Subject               string            `json:"subject" db:"subject"`
+						SessionID             string            `json:"sid,omitempty" db:"sid"`
+						RequestURL            string            `json:"request_url" db:"request_url"`
+						RPInitiated           bool              `json:"rp_initiated" db:"rp_initiated"`
+						WasHandled            bool              `json:"-" db:"was_used"`
+						Verifier              string            `json:"-" db:"verifier"`
+						PostLogoutRedirectURI string            `json:"-" db:"redir_url"`
+						Accepted              bool              `json:"-" db:"accepted"`
+						Rejected              bool              `json:"-" db:"rejected"`
+						ClientID              stdsql.NullString `json:"-" db:"client_id"`
+						ExpiresAt             sqlxx.NullTime    `json:"expires_at" db:"expires_at"`
+						RequestedAt           sqlxx.NullTime    `json:"requested_at" db:"requested_at"`
+						Client                *client.Client    `json:"client" db:"-"`
+					}
+
+					var lrs []legacyLogoutRequest
+					require.NoError(t, c.RawQuery("SELECT * FROM hydra_oauth2_logout_request").All(&lrs))
+					require.Len(t, lrs, 7)
+
+					for _, s := range lrs {
+						s.Client = nil // legacy AfterFind eager-load isn't replicated; matches existing fixtures.
+						compareWithFixture(t, s, "hydra_oauth2_logout_request", s.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_obfuscated_authentication_session", func(t *testing.T) {
+					ss := []consent.ForcedObfuscatedLoginSession{}
+					require.NoError(t, c.All(&ss))
+					require.Len(t, ss, 13)
+
+					for _, s := range ss {
+						compareWithFixture(t, s, "hydra_oauth2_obfuscated_authentication_session", fmt.Sprintf("%s_%s", s.Subject, s.ClientID))
+					}
+				})
+
+				t.Run("case=hydra_oauth2_jti_blacklist", func(t *testing.T) {
+					bjtis := []oauth2.BlacklistedJTI{}
+					require.NoError(t, c.All(&bjtis))
+					require.Len(t, bjtis, 1)
+					for _, bjti := range bjtis {
+						compareWithFixture(t, bjti, "hydra_oauth2_jti_blacklist", bjti.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_access", func(t *testing.T) {
+					as := []sql.OAuth2RequestSQL{}
+					require.NoError(t, c.RawQuery("SELECT * FROM hydra_oauth2_access").All(&as))
+					require.Len(t, as, 13)
+
+					for _, a := range as {
+						compareWithFixture(t, a, "hydra_oauth2_access", a.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_refresh", func(t *testing.T) {
+					rs := []sql.OAuth2RefreshTable{}
+					require.NoError(t, c.All(&rs))
+					require.Len(t, rs, 14)
+
+					for _, r := range rs {
+						compareWithFixture(t, r, "hydra_oauth2_refresh", r.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_code", func(t *testing.T) {
+					cs := []sql.OAuth2RequestSQL{}
+					require.NoError(t, c.RawQuery("SELECT * FROM hydra_oauth2_code").All(&cs))
+					require.Len(t, cs, 13)
+
+					for _, c := range cs {
+						compareWithFixture(t, c, "hydra_oauth2_code", c.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_oidc", func(t *testing.T) {
+					os := []sql.OAuth2RequestSQL{}
+					require.NoError(t, c.RawQuery("SELECT * FROM hydra_oauth2_oidc").All(&os))
+					require.Len(t, os, 13)
+
+					for _, o := range os {
+						compareWithFixture(t, o, "hydra_oauth2_oidc", o.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_pkce", func(t *testing.T) {
+					ps := []sql.OAuth2RequestSQL{}
+					require.NoError(t, c.RawQuery("SELECT * FROM hydra_oauth2_pkce").All(&ps))
+					require.Len(t, ps, 11)
+
+					for _, p := range ps {
+						compareWithFixture(t, p, "hydra_oauth2_pkce", p.ID)
+					}
+				})
+
+				t.Run("case=hydra_oauth2_device_auth_codes", func(t *testing.T) {
+					rs := []sql.DeviceRequestSQL{}
+					require.NoError(t, c.All(&rs))
+					require.Len(t, rs, 1)
+
+					for _, r := range rs {
+						compareWithFixture(t, r, "hydra_oauth2_device_auth_codes", r.ID)
+					}
+				})
+
+				t.Run("case=networks", func(t *testing.T) {
+					ns := []networkx.Network{}
+					require.NoError(t, c.RawQuery("SELECT * FROM networks").All(&ns))
+					require.Len(t, ns, 1)
+					for _, n := range ns {
+						testhelpersuuid.AssertUUID(t, n.ID)
+						require.NotZero(t, n.CreatedAt)
+						require.NotZero(t, n.UpdatedAt)
+					}
+				})
+			})
+
+			t.Run("down", func(t *testing.T) {
+				status, err := tm.Status(t.Context())
+				require.NoError(t, err)
+
+				// there are no proper down migrations from v2 to v1
+				var stepsDown int
+				for i := range status {
+					if status[len(status)-1-i].Version == "20220210000001000000" {
+						stepsDown = i
+						break
+					}
 				}
 
-				tables := []string{"hydra_oauth2_access", "hydra_oauth2_refresh", "hydra_oauth2_code", "hydra_oauth2_oidc"}
-				if i >= 3 {
-					tables = append(tables, "hydra_oauth2_pkce")
+				if !assert.NoError(t, tm.Down(t.Context(), stepsDown)) {
+					_ = tm.DumpMigrationSchema(t.Context())
 				}
-				ed, ebjti := expectedOauth2(i)
-				ad := &sql.OAuth2RequestSQL{}
-				for _, table := range tables {
-					require.NoError(t, d.Persister().Connection(context.Background()).RawQuery(fmt.Sprintf("select * from %s where signature = ?", table), ed.ID).First(ad))
-					assertEqualOauth2Data(t, ed, ad)
-				}
-
-				if i >= 11 {
-					abjti := &oauth2.BlacklistedJTI{}
-					require.NoError(t, c.Where("signature = ?", ebjti.ID).First(abjti))
-					assertEqualOauth2BlacklistedJTIs(t, ebjti, abjti)
-				}
-			}
-
-			x.CleanSQLPop(t, c)
-			require.NoError(t, c.Close())
+			})
 		})
 	}
 }

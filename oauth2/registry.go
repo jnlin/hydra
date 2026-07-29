@@ -1,30 +1,44 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oauth2
 
 import (
-	"github.com/ory/fosite"
-	"github.com/ory/fosite/handler/openid"
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/consent"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/x"
+	"github.com/ory/hydra/v2/aead"
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/consent"
+	"github.com/ory/hydra/v2/fosite"
+	"github.com/ory/hydra/v2/fosite/handler/openid"
+	"github.com/ory/hydra/v2/fosite/handler/rfc8628"
+	"github.com/ory/hydra/v2/jwk"
+	"github.com/ory/hydra/v2/oauth2/trust"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
 )
 
 type InternalRegistry interface {
 	client.Registry
-	x.RegistryWriter
-	x.RegistryLogger
+	jwk.Registry
+	trust.Registry
+	httpx.WriterProvider
+	logrusx.Provider
+	otelx.Provider
+	x.Transactor
 	consent.Registry
 	Registry
+	FlowCipher() *aead.XChaCha20Poly1305
 }
 
 type Registry interface {
 	OAuth2Storage() x.FositeStorer
 	OAuth2Provider() fosite.OAuth2Provider
-	AudienceStrategy() fosite.AudienceMatchingStrategy
-	ScopeStrategy() fosite.ScopeStrategy
-
-	AccessTokenJWTStrategy() jwk.JWTStrategy
-	OpenIDJWTStrategy() jwk.JWTStrategy
-
+	AccessTokenJWTSigner() jwk.JWTSigner
 	OpenIDConnectRequestValidator() *openid.OpenIDConnectRequestValidator
+	AccessRequestHooks() []AccessRequestHook
+	OAuth2ProviderConfig() fosite.Configurator
+	rfc8628.DeviceRateLimitStrategyProvider
+	rfc8628.DeviceCodeStrategyProvider
+	rfc8628.UserCodeStrategyProvider
 }

@@ -1,119 +1,154 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @Copyright 	2017-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"io"
 	"net/url"
+	"slices"
 	"strings"
 
-	"github.com/ory/hydra/driver/config"
+	"github.com/hashicorp/go-retryablehttp"
+	"github.com/pkg/errors"
 
-	"github.com/ory/x/errorsx"
+	"github.com/ory/x/httpx"
 
-	"github.com/pborman/uuid"
-
-	"github.com/ory/x/stringslice"
-	"github.com/ory/x/stringsx"
+	"github.com/ory/herodot"
+	"github.com/ory/hydra/v2/driver/config"
+	"github.com/ory/x/ipx"
 )
 
-var (
-	supportedAuthTokenSigningAlgs = []string{
-		"RS256",
-		"RS384",
-		"RS512",
-		"PS256",
-		"PS384",
-		"PS512",
-		"ES256",
-		"ES384",
-		"ES512",
-	}
-)
+var supportedAuthTokenSigningAlgs = []string{
+	"RS256",
+	"RS384",
+	"RS512",
+	"PS256",
+	"PS384",
+	"PS512",
+	"ES256",
+	"ES384",
+	"ES512",
+}
+
+func isSupportedAuthTokenSigningAlg(alg string) bool {
+	return slices.Contains(supportedAuthTokenSigningAlgs, alg)
+}
+
+type validatorRegistry interface {
+	httpx.ClientProvider
+	config.Provider
+}
 
 type Validator struct {
-	c    *http.Client
-	conf *config.Provider
+	r validatorRegistry
 }
 
-func NewValidator(conf *config.Provider) *Validator {
-	return &Validator{
-		c:    http.DefaultClient,
-		conf: conf,
-	}
+func NewValidator(r validatorRegistry) *Validator {
+	return &Validator{r: r}
 }
 
-func NewValidatorWithClient(conf *config.Provider, client *http.Client) *Validator {
-	return &Validator{
-		c:    client,
-		conf: conf,
-	}
-}
-
-func (v *Validator) Validate(c *Client) error {
-	id := uuid.New()
-	c.OutfacingID = stringsx.Coalesce(c.OutfacingID, id)
-
+func (v *Validator) Validate(ctx context.Context, c *Client) error {
 	if c.TokenEndpointAuthMethod == "" {
 		c.TokenEndpointAuthMethod = "client_secret_basic"
 	} else if c.TokenEndpointAuthMethod == "private_key_jwt" {
-		if len(c.JSONWebKeysURI) == 0 && c.JSONWebKeys == nil {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHint("When token_endpoint_auth_method is 'private_key_jwt', either jwks or jwks_uri must be set."))
+		if len(c.JSONWebKeysURI) == 0 && c.GetJSONWebKeys() == nil {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHint("When token_endpoint_auth_method is 'private_key_jwt', either jwks or jwks_uri must be set."))
 		}
 		if c.TokenEndpointAuthSigningAlgorithm != "" && !isSupportedAuthTokenSigningAlg(c.TokenEndpointAuthSigningAlgorithm) {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHint("Only RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 and ES512 are supported as algorithms for private key authentication."))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHint("Only RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 and ES512 are supported as algorithms for private key authentication."))
 		}
 	}
 
-	if len(c.JSONWebKeysURI) > 0 && c.JSONWebKeys != nil {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithHint("Fields jwks and jwks_uri can not both be set, you must choose one."))
+	if len(c.JSONWebKeysURI) > 0 && c.GetJSONWebKeys() != nil {
+		return errors.WithStack(ErrInvalidClientMetadata.WithHint("Fields jwks and jwks_uri can not both be set, you must choose one."))
+	}
+
+	if jsonWebKeys := c.GetJSONWebKeys(); jsonWebKeys != nil {
+		for _, k := range jsonWebKeys.Keys {
+			if !k.Valid() {
+				return errors.WithStack(ErrInvalidClientMetadata.WithHint("Invalid JSON web key in set."))
+			}
+		}
+	}
+
+	if v.r.Config().ClientHTTPNoPrivateIPRanges() {
+		values := map[string]string{}
+		if c.JSONWebKeysURI != "" {
+			values["jwks_uri"] = c.JSONWebKeysURI
+		}
+		if c.BackChannelLogoutURI != "" {
+			values["backchannel_logout_uri"] = c.BackChannelLogoutURI
+		}
+		if c.SectorIdentifierURI != "" {
+			values["sector_identifier_uri"] = c.SectorIdentifierURI
+		}
+
+		for k, v := range c.RequestURIs {
+			if v != "" {
+				values[fmt.Sprintf("request_uris.%d", k)] = v
+			}
+		}
+
+		if err := ipx.AreAllAssociatedIPsAllowed(ctx, values); err != nil {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Client IP address is not allowed: %s", err))
+		}
+	}
+
+	// TODO: For clients that support dynamic registration, validate that each of these URIs are part of the redirect_uris, as per the spec.
+	//    The authorization server SHOULD check to see if the "logo_uri", "tos_uri", "client_uri", and "policy_uri" have the same host and scheme as the those defined in the array of "redirect_uris" and that all of these URIs resolve to valid web pages.
+	//    https://datatracker.ietf.org/doc/html/rfc7591#section-5
+
+	// TODO: In addition, the logo_uri should be a valid image.
+	//    The value of this field MUST point to a valid image file.
+
+	for f, uri := range map[string]string{
+		"tos_uri":    c.TermsOfServiceURI,
+		"policy_uri": c.PolicyURI,
+		"logo_uri":   c.LogoURI,
+		"client_uri": c.ClientURI,
+	} {
+		if uri == "" {
+			continue
+		}
+		u, err := url.ParseRequestURI(uri)
+		if err != nil {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Field %s must be a valid URI.", f))
+		}
+
+		if u.Scheme != "https" && u.Scheme != "http" {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("%s must use https:// or http:// as HTTP scheme for field %s.", uri, f))
+		}
 	}
 
 	if len(c.Secret) > 0 && len(c.Secret) < 6 {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithHint("Field client_secret must contain a secret that is at least 6 characters long."))
+		return errors.WithStack(ErrInvalidClientMetadata.WithHint("Field client_secret must contain a secret that is at least 6 characters long."))
 	}
 
 	if len(c.Scope) == 0 {
-		c.Scope = strings.Join(v.conf.DefaultClientScope(), " ")
+		c.Scope = strings.Join(v.r.Config().DefaultClientScope(ctx), " ")
 	}
 
 	for k, origin := range c.AllowedCORSOrigins {
 		u, err := url.Parse(origin)
 		if err != nil {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s from allowed_cors_origins could not be parsed: %s", origin, err))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s from allowed_cors_origins could not be parsed: %s", origin, err))
 		}
 
 		if u.Scheme != "https" && u.Scheme != "http" {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s must use https:// or http:// as HTTP scheme.", origin))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s must use https:// or http:// as HTTP scheme.", origin))
 		}
 
 		if u.User != nil && len(u.User.String()) > 0 {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s has HTTP user and/or password set which is not allowed.", origin))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s has HTTP user and/or password set which is not allowed.", origin))
 		}
 
 		u.Path = strings.TrimRight(u.Path, "/")
 		if len(u.Path)+len(u.RawQuery)+len(u.Fragment) > 0 {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s must have an empty path, query, and fragment but one of the parts is not empty.", origin))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Origin URL %s must have an empty path, query, and fragment but one of the parts is not empty.", origin))
 		}
 
 		c.AllowedCORSOrigins[k] = u.String()
@@ -123,7 +158,7 @@ func (v *Validator) Validate(c *Client) error {
 	c.SecretExpiresAt = 0
 
 	if len(c.SectorIdentifierURI) > 0 {
-		if err := v.ValidateSectorIdentifierURL(c.SectorIdentifierURI, c.GetRedirectURIs()); err != nil {
+		if err := v.ValidateSectorIdentifierURL(ctx, c.SectorIdentifierURI, c.GetRedirectURIs()); err != nil {
 			return err
 		}
 	}
@@ -133,98 +168,114 @@ func (v *Validator) Validate(c *Client) error {
 	}
 
 	if c.UserinfoSignedResponseAlg != "none" && c.UserinfoSignedResponseAlg != "RS256" {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithHint("Field userinfo_signed_response_alg can either be 'none' or 'RS256'."))
+		return errors.WithStack(ErrInvalidClientMetadata.WithHint("Field userinfo_signed_response_alg can either be 'none' or 'RS256'."))
 	}
 
-	var redirs []url.URL
-	for _, r := range c.RedirectURIs {
-		u, err := url.ParseRequestURI(r)
-		if err != nil {
-			return errorsx.WithStack(ErrInvalidRedirectURI.WithHintf("Unable to parse redirect URL: %s", r))
-		}
-		redirs = append(redirs, *u)
-
+	redirs := make([]*url.URL, len(c.RedirectURIs))
+	for i, r := range c.RedirectURIs {
 		if strings.Contains(r, "#") {
-			return errorsx.WithStack(ErrInvalidRedirectURI.WithHint("Redirect URIs must not contain fragments (#)."))
+			return errors.WithStack(ErrInvalidRedirectURI.WithHint("Redirect URIs must not contain fragments (#)."))
+		}
+		var err error
+		redirs[i], err = url.ParseRequestURI(r)
+		if err != nil {
+			return errors.WithStack(ErrInvalidRedirectURI.WithHintf("Unable to parse redirect URL: %s", r))
 		}
 	}
 
 	if c.SubjectType != "" {
-		if !stringslice.Has(v.conf.SubjectTypesSupported(), c.SubjectType) {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Subject type %s is not supported by server, only %v are allowed.", c.SubjectType, v.conf.SubjectTypesSupported()))
+		if !slices.Contains(v.r.Config().SubjectTypesSupported(ctx, c), c.SubjectType) {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Subject type %s is not supported by server, only %v are allowed.", c.SubjectType, v.r.Config().SubjectTypesSupported(ctx, c)))
 		}
 	} else {
-		if stringslice.Has(v.conf.SubjectTypesSupported(), "public") {
+		supportedTypes := v.r.Config().SubjectTypesSupported(ctx, c)
+		if slices.Contains(supportedTypes, "public") {
 			c.SubjectType = "public"
 		} else {
-			c.SubjectType = v.conf.SubjectTypesSupported()[0]
+			c.SubjectType = supportedTypes[0]
 		}
 	}
 
 	for _, l := range c.PostLogoutRedirectURIs {
 		u, err := url.ParseRequestURI(l)
 		if err != nil {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Unable to parse post_logout_redirect_uri: %s", l))
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Unable to parse post_logout_redirect_uri: %s", l))
 		}
 
-		var found bool
-		for _, r := range redirs {
-			if r.Hostname() == u.Hostname() &&
-				r.Port() == u.Port() &&
-				r.Scheme == u.Scheme {
-				found = true
-			}
-		}
-
-		if !found {
-			return errorsx.WithStack(ErrInvalidClientMetadata.
-				WithHintf(`post_logout_redirect_uri "%s" must match the domain, port, scheme of at least one of the registered redirect URIs but did not'`, l),
+		if !slices.ContainsFunc(redirs, func(r *url.URL) bool {
+			return r.Scheme == u.Scheme && r.Hostname() == u.Hostname() && r.Port() == u.Port()
+		}) {
+			return errors.WithStack(ErrInvalidClientMetadata.
+				WithHintf("post_logout_redirect_uri %q must match the domain, port, scheme of at least one of the registered redirect URIs but did not", l),
 			)
 		}
 	}
 
+	if c.AccessTokenStrategy != "" {
+		s, err := config.ToAccessTokenStrategyType(c.AccessTokenStrategy)
+		if err != nil {
+			return errors.WithStack(ErrInvalidClientMetadata.
+				WithHintf("invalid access token strategy: %v", err))
+		}
+		// Canonicalize, just in case.
+		c.AccessTokenStrategy = string(s)
+	}
+
 	return nil
 }
 
-func (v *Validator) ValidateSectorIdentifierURL(location string, redirectURIs []string) error {
+func (v *Validator) ValidateDynamicRegistration(ctx context.Context, c *Client) error {
+	if c.Metadata != nil {
+		return errors.WithStack(ErrInvalidClientMetadata.WithHint(`"metadata" cannot be set for dynamic client registration`))
+	}
+	if c.AccessTokenStrategy != "" {
+		return errors.WithStack(herodot.ErrBadRequest().WithReasonf("It is not allowed to choose your own access token strategy."))
+	}
+	if c.SkipConsent {
+		return errors.WithStack(ErrInvalidRequest.WithDescription(`"skip_consent" cannot be set for dynamic client registration`))
+	}
+	if c.SkipLogoutConsent.Bool {
+		return errors.WithStack(ErrInvalidRequest.WithDescription(`"skip_logout_consent" cannot be set for dynamic client registration`))
+	}
+
+	return v.Validate(ctx, c)
+}
+
+func (v *Validator) ValidateSectorIdentifierURL(ctx context.Context, location string, redirectURIs []string) error {
 	l, err := url.Parse(location)
 	if err != nil {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithHintf("Value of sector_identifier_uri could not be parsed because %s.", err))
+		return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Value of sector_identifier_uri could not be parsed because %s.", err))
 	}
 
 	if l.Scheme != "https" {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithDebug("Value sector_identifier_uri must be an HTTPS URL but it is not."))
+		return errors.WithStack(ErrInvalidClientMetadata.WithDebug("Value sector_identifier_uri must be an HTTPS URL but it is not."))
 	}
 
-	response, err := v.c.Get(location)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", location, nil)
 	if err != nil {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Unable to connect to URL set by sector_identifier_uri: %s", err)))
+		return errors.WithStack(ErrInvalidClientMetadata.WithDebugf("Value sector_identifier_uri must be an HTTPS URL but it is not: %s", err.Error()))
 	}
-	defer response.Body.Close()
+	response, err := v.r.HTTPClient(ctx).Do(req)
+	if err != nil {
+		return errors.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Unable to connect to URL set by sector_identifier_uri: %s", err)))
+	}
+	defer response.Body.Close() //nolint:errcheck
+	response.Body = io.NopCloser(io.LimitReader(response.Body, 5<<20 /* 5 MiB */))
 
 	var urls []string
 	if err := json.NewDecoder(response.Body).Decode(&urls); err != nil {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Unable to decode values from sector_identifier_uri: %s", err)))
+		return errors.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Unable to decode values from sector_identifier_uri: %s", err)))
 	}
 
 	if len(urls) == 0 {
-		return errorsx.WithStack(ErrInvalidClientMetadata.WithDebug("Array from sector_identifier_uri contains no items"))
+		return errors.WithStack(ErrInvalidClientMetadata.WithDebug("Array from sector_identifier_uri contains no items"))
 	}
 
 	for _, r := range redirectURIs {
-		if !stringslice.Has(urls, r) {
-			return errorsx.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Redirect URL \"%s\" does not match values from sector_identifier_uri.", r)))
+		if !slices.Contains(urls, r) {
+			return errors.WithStack(ErrInvalidClientMetadata.WithDebug(fmt.Sprintf("Redirect URL \"%s\" does not match values from sector_identifier_uri.", r)))
 		}
 	}
 
 	return nil
-}
-
-func isSupportedAuthTokenSigningAlg(alg string) bool {
-	for _, sAlg := range supportedAuthTokenSigningAlgs {
-		if alg == sAlg {
-			return true
-		}
-	}
-	return false
 }

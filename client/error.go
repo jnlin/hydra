@@ -1,9 +1,12 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package client
 
 import (
 	"net/http"
 
-	"github.com/ory/fosite"
+	"github.com/ory/hydra/v2/fosite"
 )
 
 var ErrInvalidClientMetadata = &fosite.RFC6749Error{
@@ -15,5 +18,11 @@ var ErrInvalidClientMetadata = &fosite.RFC6749Error{
 var ErrInvalidRedirectURI = &fosite.RFC6749Error{
 	DescriptionField: "The value of one or more redirect_uris is invalid.",
 	ErrorField:       "invalid_redirect_uri",
+	CodeField:        http.StatusBadRequest,
+}
+
+var ErrInvalidRequest = &fosite.RFC6749Error{
+	DescriptionField: "The request is missing a required parameter, includes an unsupported parameter value (other than grant type), repeats a parameter, includes multiple credentials, utilizes more than one mechanism for authenticating the client, or is otherwise malformed.",
+	ErrorField:       "invalid_request",
 	CodeField:        http.StatusBadRequest,
 }

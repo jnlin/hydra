@@ -1,22 +1,5 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package oauth2_test
 
@@ -24,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -32,142 +15,91 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/hydra/internal/testhelpers"
+	"github.com/ory/hydra/v2/driver"
 
-	"github.com/go-openapi/strfmt"
-
-	"github.com/ory/hydra/internal/httpclient/client/admin"
-	"github.com/ory/hydra/internal/httpclient/models"
-
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/x"
-
-	"github.com/ory/hydra/driver/config"
-	"github.com/ory/hydra/internal"
-	"github.com/ory/x/urlx"
-
-	jwt2 "github.com/dgrijalva/jwt-go"
-	"github.com/golang/mock/gomock"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
-	"github.com/ory/fosite"
-	"github.com/ory/fosite/handler/openid"
-	"github.com/ory/fosite/token/jwt"
-	"github.com/ory/hydra/client"
-	hydra "github.com/ory/hydra/internal/httpclient/client"
-	"github.com/ory/hydra/oauth2"
+	hydra "github.com/ory/hydra-client-go/v2"
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/driver/config"
+	"github.com/ory/hydra/v2/fosite"
+	"github.com/ory/hydra/v2/fosite/handler/openid"
+	"github.com/ory/hydra/v2/fosite/token/jwt"
+	"github.com/ory/hydra/v2/internal/testhelpers"
+	"github.com/ory/hydra/v2/jwk"
+	"github.com/ory/hydra/v2/oauth2"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/x/configx"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/snapshotx"
 )
 
 var lifespan = time.Hour
 
 func TestHandlerDeleteHandler(t *testing.T) {
-	conf := internal.NewConfigurationWithDefaults()
-	conf.MustSet(config.KeyIssuerURL, "http://hydra.localhost")
-	reg := internal.NewRegistryMemory(t, conf)
+	t.Parallel()
+
+	ctx := t.Context()
+	reg := testhelpers.NewRegistryMemory(t, driver.WithConfigOptions(configx.WithValue(config.KeyIssuerURL, "http://hydra.localhost")))
 
 	cm := reg.ClientManager()
 	store := reg.OAuth2Storage()
 
-	h := oauth2.NewHandler(reg, conf)
+	h := oauth2.NewHandler(reg)
 
 	deleteRequest := &fosite.Request{
 		ID:             "del-1",
 		RequestedAt:    time.Now().Round(time.Second),
-		Client:         &client.Client{OutfacingID: "foobar"},
+		Client:         &client.Client{ID: "foobar"},
 		RequestedScope: fosite.Arguments{"fa", "ba"},
 		GrantedScope:   fosite.Arguments{"fa", "ba"},
 		Form:           url.Values{"foo": []string{"bar", "baz"}},
 		Session:        &oauth2.Session{DefaultSession: &openid.DefaultSession{Subject: "bar"}},
 	}
-	require.NoError(t, cm.CreateClient(context.Background(), deleteRequest.Client.(*client.Client)))
-	require.NoError(t, store.CreateAccessTokenSession(context.Background(), deleteRequest.ID, deleteRequest))
+	require.NoError(t, cm.CreateClient(ctx, deleteRequest.Client.(*client.Client)))
+	require.NoError(t, store.CreateAccessTokenSession(ctx, deleteRequest.ID, deleteRequest))
 
-	r := x.NewRouterAdmin()
-	h.SetRoutes(r, r.RouterPublic(), func(h http.Handler) http.Handler {
-		return h
-	})
+	r := httprouterx.NewRouterAdminWithPrefix()
+	h.SetPublicRoutes(r.ToPublic(), func(h http.Handler) http.Handler { return h })
+	h.SetAdminRoutes(r)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
-	c := hydra.NewHTTPClientWithConfig(nil, &hydra.TransportConfig{Schemes: []string{"http"}, Host: urlx.ParseOrPanic(ts.URL).Host})
-	_, err := c.Admin.DeleteOAuth2Token(admin.NewDeleteOAuth2TokenParams().WithClientID("foobar"))
+	c := hydra.NewAPIClient(hydra.NewConfiguration())
+	c.GetConfig().Servers = hydra.ServerConfigurations{{URL: ts.URL}}
+
+	_, err := c.
+		OAuth2API.DeleteOAuth2Token(ctx).
+		ClientId("foobar").Execute()
 	require.NoError(t, err)
 
 	ds := new(oauth2.Session)
-	ctx := context.Background()
 	_, err = store.GetAccessTokenSession(ctx, "del-1", ds)
 	require.Error(t, err, "not_found")
 }
 
-func TestHandlerFlushHandler(t *testing.T) {
-
-	t.Run("case=not-after", func(t *testing.T) {
-		ctx := context.Background()
-
-		// Setup database and tests
-		jt := testhelpers.NewConsentJanitorTestHelper(t.Name())
-		reg, err := jt.GetRegistry(ctx, t.Name())
-		require.NoError(t, err)
-
-		// Setup rest server
-		h := oauth2.NewHandler(reg, jt.GetConfig())
-
-		r := x.NewRouterAdmin()
-		h.SetRoutes(r, r.RouterPublic(), func(h http.Handler) http.Handler {
-			return h
-		})
-
-		ts := httptest.NewServer(r)
-		defer ts.Close()
-		c := hydra.NewHTTPClientWithConfig(nil, &hydra.TransportConfig{Schemes: []string{"http"}, Host: urlx.ParseOrPanic(ts.URL).Host})
-
-		// Get the notAfter test cycles
-		notAfterTests := testhelpers.NewConsentJanitorTestHelper(t.Name()).GetNotAfterTestCycles()
-
-		for k, v := range notAfterTests {
-			t.Run(fmt.Sprintf("case=%s", k), func(t *testing.T) {
-				ctx := context.Background()
-				jt := testhelpers.NewConsentJanitorTestHelper(t.Name())
-
-				notAfter := time.Now().Round(time.Second).Add(-v)
-
-				t.Run("step=setup-access-token", jt.AccessTokenNotAfterSetup(ctx, reg.ClientManager(), reg.OAuth2Storage()))
-				t.Run("step=setup-refresh-token", jt.RefreshTokenNotAfterSetup(ctx, reg.ClientManager(), reg.OAuth2Storage()))
-
-				t.Run("step=cleanup", func(t *testing.T) {
-					_, err := c.Admin.FlushInactiveOAuth2Tokens(admin.NewFlushInactiveOAuth2TokensParams().WithBody(&models.FlushInactiveOAuth2TokensRequest{NotAfter: strfmt.DateTime(notAfter)}))
-					require.NoError(t, err)
-				})
-
-				t.Run("step=validate-access-token", jt.AccessTokenNotAfterValidate(ctx, notAfter, reg.OAuth2Storage()))
-				t.Run("step=validate-refresh-token", jt.RefreshTokenNotAfterValidate(ctx, notAfter, reg.OAuth2Storage()))
-			})
-		}
-
-	})
-}
-
 func TestUserinfo(t *testing.T) {
-	conf := internal.NewConfigurationWithDefaults()
-	conf.MustSet(config.KeyScopeStrategy, "")
-	conf.MustSet(config.KeyAuthCodeLifespan, lifespan)
-	conf.MustSet(config.KeyIssuerURL, "http://hydra.localhost")
-	reg := internal.NewRegistryMemory(t, conf)
-	internal.MustEnsureRegistryKeys(reg, x.OpenIDConnectKeyName)
+	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	op := NewMockOAuth2Provider(ctrl)
-	defer ctrl.Finish()
-	reg.WithOAuth2Provider(op)
+	t.Cleanup(ctrl.Finish)
 
-	h := reg.OAuth2Handler()
+	reg := testhelpers.NewRegistryMemory(t, driver.WithConfigOptions(configx.WithValues(map[string]any{
+		config.KeyScopeStrategy:    "",
+		config.KeyAuthCodeLifespan: lifespan,
+		config.KeyIssuerURL:        "http://hydra.localhost",
+	})), driver.WithOAuth2Provider(op))
+	testhelpers.MustEnsureRegistryKeys(t, reg, x.OpenIDConnectKeyName)
 
-	router := x.NewRouterAdmin()
-	h.SetRoutes(router, router.RouterPublic(), func(h http.Handler) http.Handler {
-		return h
-	})
+	h := oauth2.NewHandler(reg)
+
+	router := httprouterx.NewRouterAdminWithPrefix()
+	h.SetPublicRoutes(router.ToPublic(), func(h http.Handler) http.Handler { return h })
+	h.SetAdminRoutes(router)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -190,7 +122,7 @@ func TestUserinfo(t *testing.T) {
 					Return(fosite.RefreshToken, nil, nil)
 			},
 			checkForUnauthorized: func(t *testing.T, body []byte, headers http.Header) {
-				assert.True(t, headers.Get("WWW-Authenticate") != "", "%s", headers)
+				assert.True(t, headers.Get("WWW-Authenticate") == `Bearer error="invalid_token",error_description="Only access tokens are allowed in the authorization header."`, "%s", headers)
 			},
 			expectStatusCode: http.StatusUnauthorized,
 		},
@@ -201,7 +133,7 @@ func TestUserinfo(t *testing.T) {
 					Return(fosite.AccessToken, nil, fosite.ErrRequestUnauthorized)
 			},
 			checkForUnauthorized: func(t *testing.T, body []byte, headers http.Header) {
-				assert.True(t, headers.Get("WWW-Authenticate") != "", "%s", headers)
+				assert.True(t, headers.Get("WWW-Authenticate") == `Bearer error="request_unauthorized",error_description="The request could not be authorized. Check that you provided valid credentials in the right format."`, "%s", headers)
 			},
 			expectStatusCode: http.StatusUnauthorized,
 		},
@@ -209,67 +141,8 @@ func TestUserinfo(t *testing.T) {
 			setup: func(t *testing.T) {
 				op.EXPECT().
 					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
-					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, session fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
-						session = &oauth2.Session{
-							DefaultSession: &openid.DefaultSession{
-								Claims: &jwt.IDTokenClaims{
-									Subject: "alice",
-								},
-								Headers: new(jwt.Headers),
-								Subject: "alice",
-							},
-							Extra: map[string]interface{}{},
-						}
-
-						return fosite.AccessToken, &fosite.AccessRequest{
-							Request: fosite.Request{
-								Client:  &client.Client{},
-								Session: session,
-							},
-						}, nil
-					})
-			},
-			expectStatusCode: http.StatusOK,
-			checkForSuccess: func(t *testing.T, body []byte) {
-				assert.True(t, strings.Contains(string(body), `"sub":"alice"`), "%s", body)
-			},
-		},
-		{
-			setup: func(t *testing.T) {
-				op.EXPECT().
-					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
-					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, session fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
-						session = &oauth2.Session{
-							DefaultSession: &openid.DefaultSession{
-								Claims: &jwt.IDTokenClaims{
-									Subject: "another-alice",
-								},
-								Headers: new(jwt.Headers),
-								Subject: "alice",
-							},
-							Extra: map[string]interface{}{},
-						}
-
-						return fosite.AccessToken, &fosite.AccessRequest{
-							Request: fosite.Request{
-								Client:  &client.Client{},
-								Session: session,
-							},
-						}, nil
-					})
-			},
-			expectStatusCode: http.StatusOK,
-			checkForSuccess: func(t *testing.T, body []byte) {
-				assert.False(t, strings.Contains(string(body), `"sub":"alice"`), "%s", body)
-				assert.True(t, strings.Contains(string(body), `"sub":"another-alice"`), "%s", body)
-			},
-		},
-		{
-			setup: func(t *testing.T) {
-				op.EXPECT().
-					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
-					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, session fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
-						session = &oauth2.Session{
+					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, _ fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
+						session := &oauth2.Session{
 							DefaultSession: &openid.DefaultSession{
 								Claims: &jwt.IDTokenClaims{
 									Subject: "alice",
@@ -283,6 +156,76 @@ func TestUserinfo(t *testing.T) {
 						return fosite.AccessToken, &fosite.AccessRequest{
 							Request: fosite.Request{
 								Client: &client.Client{
+									ID: "foobar",
+								},
+								Session: session,
+							},
+						}, nil
+					})
+			},
+			expectStatusCode: http.StatusOK,
+			checkForSuccess: func(t *testing.T, body []byte) {
+				bodyString := string(body)
+				assert.True(t, strings.Contains(bodyString, `"sub":"alice"`), "%s", body)
+				assert.True(t, strings.Contains(bodyString, `"aud":["foobar"]`), "%s", body)
+			},
+		},
+		{
+			setup: func(t *testing.T) {
+				op.EXPECT().
+					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
+					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, _ fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
+						session := &oauth2.Session{
+							DefaultSession: &openid.DefaultSession{
+								Claims: &jwt.IDTokenClaims{
+									Subject:  "another-alice",
+									Audience: []string{"something-else"},
+								},
+								Headers: new(jwt.Headers),
+								Subject: "alice",
+							},
+							Extra: map[string]interface{}{},
+						}
+
+						return fosite.AccessToken, &fosite.AccessRequest{
+							Request: fosite.Request{
+								Client: &client.Client{
+									ID: "foobar",
+								},
+								Session: session,
+							},
+						}, nil
+					})
+			},
+			expectStatusCode: http.StatusOK,
+			checkForSuccess: func(t *testing.T, body []byte) {
+				bodyString := string(body)
+				assert.False(t, strings.Contains(bodyString, `"sub":"alice"`), "%s", body)
+				assert.True(t, strings.Contains(bodyString, `"sub":"another-alice"`), "%s", body)
+				assert.True(t, strings.Contains(bodyString, `"aud":["something-else","foobar"]`), "%s", body)
+			},
+		},
+		{
+			setup: func(t *testing.T) {
+				op.EXPECT().
+					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
+					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, _ fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
+						session := &oauth2.Session{
+							DefaultSession: &openid.DefaultSession{
+								Claims: &jwt.IDTokenClaims{
+									Subject:  "alice",
+									Audience: []string{"foobar"},
+								},
+								Headers: new(jwt.Headers),
+								Subject: "alice",
+							},
+							Extra: map[string]interface{}{},
+						}
+
+						return fosite.AccessToken, &fosite.AccessRequest{
+							Request: fosite.Request{
+								Client: &client.Client{
+									ID:                        "foobar",
 									UserinfoSignedResponseAlg: "none",
 								},
 								Session: session,
@@ -292,15 +235,17 @@ func TestUserinfo(t *testing.T) {
 			},
 			expectStatusCode: http.StatusOK,
 			checkForSuccess: func(t *testing.T, body []byte) {
-				assert.True(t, strings.Contains(string(body), `"sub":"alice"`), "%s", body)
+				bodyString := string(body)
+				assert.True(t, strings.Contains(bodyString, `"sub":"alice"`), "%s", body)
+				assert.True(t, strings.Contains(bodyString, `"aud":["foobar"]`), "%s", body)
 			},
 		},
 		{
 			setup: func(t *testing.T) {
 				op.EXPECT().
 					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
-					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, session fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
-						session = &oauth2.Session{
+					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, _ fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
+						session := &oauth2.Session{
 							DefaultSession: &openid.DefaultSession{
 								Claims: &jwt.IDTokenClaims{
 									Subject: "alice",
@@ -327,8 +272,8 @@ func TestUserinfo(t *testing.T) {
 			setup: func(t *testing.T) {
 				op.EXPECT().
 					IntrospectToken(gomock.Any(), gomock.Eq("access-token"), gomock.Eq(fosite.AccessToken), gomock.Any()).
-					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, session fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
-						session = &oauth2.Session{
+					DoAndReturn(func(_ context.Context, _ string, _ fosite.TokenType, _ fosite.Session, _ ...string) (fosite.TokenType, fosite.AccessRequester, error) {
+						session := &oauth2.Session{
 							DefaultSession: &openid.DefaultSession{
 								Claims: &jwt.IDTokenClaims{
 									Subject: "alice",
@@ -342,7 +287,7 @@ func TestUserinfo(t *testing.T) {
 						return fosite.AccessToken, &fosite.AccessRequest{
 							Request: fosite.Request{
 								Client: &client.Client{
-									OutfacingID:               "foobar-client",
+									ID:                        "foobar-client",
 									UserinfoSignedResponseAlg: "RS256",
 								},
 								Session: session,
@@ -352,17 +297,17 @@ func TestUserinfo(t *testing.T) {
 			},
 			expectStatusCode: http.StatusOK,
 			checkForSuccess: func(t *testing.T, body []byte) {
-				claims, err := jwt2.Parse(string(body), func(token *jwt2.Token) (interface{}, error) {
-					keys, err := reg.KeyManager().GetKeySet(context.Background(), x.OpenIDConnectKeyName)
+				claims, err := jwt.Parse(string(body), func(token *jwt.Token) (interface{}, error) {
+					keys, err := reg.KeyManager().GetKeySet(t.Context(), x.OpenIDConnectKeyName)
 					require.NoError(t, err)
 					t.Logf("%+v", keys)
-					key, err := jwk.FindKeyByPrefix(keys, "public")
-					return jwk.MustRSAPublic(key), nil
+					key, _ := jwk.FindPublicKey(keys)
+					return key.Key, nil
 				})
 				require.NoError(t, err)
-				assert.EqualValues(t, "alice", claims.Claims.(jwt2.MapClaims)["sub"])
-				assert.EqualValues(t, []interface{}{"foobar-client"}, claims.Claims.(jwt2.MapClaims)["aud"], "%#v", claims.Claims)
-				assert.NotEmpty(t, claims.Claims.(jwt2.MapClaims)["jti"])
+				assert.EqualValues(t, "alice", claims.Claims["sub"])
+				assert.EqualValuesf(t, []any{"foobar-client"}, claims.Claims["aud"], "%#v", claims.Claims)
+				assert.NotEmpty(t, claims.Claims["jti"])
 			},
 		},
 	} {
@@ -372,12 +317,12 @@ func TestUserinfo(t *testing.T) {
 			req, err := http.NewRequest("GET", ts.URL+"/userinfo", nil)
 			require.NoError(t, err)
 			req.Header.Set("Authorization", "Bearer access-token")
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := testhelpers.NewTestClient(t).Do(req)
 			require.NoError(t, err)
-			defer resp.Body.Close()
-			require.EqualValues(t, tc.expectStatusCode, resp.StatusCode)
-			body, err := ioutil.ReadAll(resp.Body)
+			t.Cleanup(func() { _ = resp.Body.Close() })
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
+			require.Equalf(t, tc.expectStatusCode, resp.StatusCode, "body: %s", body)
 			if tc.expectStatusCode == http.StatusOK {
 				tc.checkForSuccess(t, body)
 			} else if tc.expectStatusCode == http.StatusUnauthorized {
@@ -388,57 +333,90 @@ func TestUserinfo(t *testing.T) {
 }
 
 func TestHandlerWellKnown(t *testing.T) {
-	conf := internal.NewConfigurationWithDefaults()
-	conf.MustSet(config.KeyScopeStrategy, "DEPRECATED_HIERARCHICAL_SCOPE_STRATEGY")
-	conf.MustSet(config.KeyIssuerURL, "http://hydra.localhost")
-	conf.MustSet(config.KeySubjectTypesSupported, []string{"pairwise", "public"})
-	conf.MustSet(config.KeyOIDCDiscoverySupportedClaims, []string{"sub"})
-	conf.MustSet(config.KeyOAuth2ClientRegistrationURL, "http://client-register/registration")
-	conf.MustSet(config.KeyOIDCDiscoveryUserinfoEndpoint, "/userinfo")
-	reg := internal.NewRegistryMemory(t, conf)
+	t.Parallel()
 
-	h := oauth2.NewHandler(reg, conf)
+	reg := testhelpers.NewRegistryMemory(t, driver.WithConfigOptions(configx.WithValues(map[string]any{
+		config.KeyScopeStrategy:                 "DEPRECATED_HIERARCHICAL_SCOPE_STRATEGY",
+		config.KeyIssuerURL:                     "http://hydra.localhost",
+		config.KeySubjectTypesSupported:         []string{"pairwise", "public"},
+		config.KeyOIDCDiscoverySupportedClaims:  []string{"sub"},
+		config.KeyOAuth2ClientRegistrationURL:   "http://client-register/registration",
+		config.KeyOIDCDiscoveryUserinfoEndpoint: "/userinfo",
+	})))
+	t.Run(fmt.Sprintf("hsm_enabled=%v", reg.Config().HSMEnabled()), func(t *testing.T) {
+		testhelpers.MustEnsureRegistryKeys(t, reg, x.OpenIDConnectKeyName)
 
-	r := x.NewRouterAdmin()
-	h.SetRoutes(r, r.RouterPublic(), func(h http.Handler) http.Handler {
-		return h
+		h := oauth2.NewHandler(reg)
+
+		r := httprouterx.NewRouterAdminWithPrefix()
+		h.SetPublicRoutes(r.ToPublic(), func(h http.Handler) http.Handler { return h })
+		h.SetAdminRoutes(r)
+		ts := httptest.NewServer(r)
+		defer ts.Close()
+
+		res, err := testhelpers.NewTestClient(t).Get(ts.URL + "/.well-known/openid-configuration")
+		require.NoError(t, err)
+		defer func() { _ = res.Body.Close() }()
+
+		var wellKnownResp hydra.OidcConfiguration
+		err = json.NewDecoder(res.Body).Decode(&wellKnownResp)
+		require.NoError(t, err, "problem decoding wellknown json response: %+v", err)
+
+		snapshotOpts := []snapshotx.Opt{}
+		if reg.Config().HSMEnabled() {
+			// The signing algorithm is not stable in the HSM tests, because the key is kept
+			// in the HSM and persists across test runs.
+			snapshotOpts = append(snapshotOpts, snapshotx.ExceptPaths(
+				"id_token_signed_response_alg",
+				"id_token_signing_alg_values_supported",
+				"userinfo_signed_response_alg",
+				"userinfo_signing_alg_values_supported",
+			))
+		}
+		snapshotx.SnapshotT(t, wellKnownResp, snapshotOpts...)
 	})
-	ts := httptest.NewServer(r)
-	defer ts.Close()
+}
 
-	res, err := http.Get(ts.URL + "/.well-known/openid-configuration")
-	require.NoError(t, err)
-	defer res.Body.Close()
+func TestHandlerOauthAuthorizationServer(t *testing.T) {
+	t.Parallel()
 
-	trueConfig := oauth2.WellKnown{
-		Issuer:                                 strings.TrimRight(conf.IssuerURL().String(), "/") + "/",
-		AuthURL:                                conf.OAuth2AuthURL().String(),
-		TokenURL:                               conf.OAuth2TokenURL().String(),
-		JWKsURI:                                conf.JWKSURL().String(),
-		RevocationEndpoint:                     urlx.AppendPaths(conf.IssuerURL(), oauth2.RevocationPath).String(),
-		RegistrationEndpoint:                   conf.OAuth2ClientRegistrationURL().String(),
-		SubjectTypes:                           []string{"pairwise", "public"},
-		ResponseTypes:                          []string{"code", "code id_token", "id_token", "token id_token", "token", "token id_token code"},
-		ClaimsSupported:                        conf.OIDCDiscoverySupportedClaims(),
-		ScopesSupported:                        conf.OIDCDiscoverySupportedScope(),
-		UserinfoEndpoint:                       conf.OIDCDiscoveryUserinfoEndpoint().String(),
-		TokenEndpointAuthMethodsSupported:      []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
-		GrantTypesSupported:                    []string{"authorization_code", "implicit", "client_credentials", "refresh_token"},
-		ResponseModesSupported:                 []string{"query", "fragment"},
-		IDTokenSigningAlgValuesSupported:       []string{"RS256"},
-		UserinfoSigningAlgValuesSupported:      []string{"none", "RS256"},
-		RequestParameterSupported:              true,
-		RequestURIParameterSupported:           true,
-		RequireRequestURIRegistration:          true,
-		BackChannelLogoutSupported:             true,
-		BackChannelLogoutSessionSupported:      true,
-		FrontChannelLogoutSupported:            true,
-		FrontChannelLogoutSessionSupported:     true,
-		EndSessionEndpoint:                     urlx.AppendPaths(conf.IssuerURL(), oauth2.LogoutPath).String(),
-		RequestObjectSigningAlgValuesSupported: []string{"RS256", "none"},
-	}
-	var wellKnownResp oauth2.WellKnown
-	err = json.NewDecoder(res.Body).Decode(&wellKnownResp)
-	require.NoError(t, err, "problem decoding wellknown json response: %+v", err)
-	assert.EqualValues(t, trueConfig, wellKnownResp)
+	reg := testhelpers.NewRegistryMemory(t, driver.WithConfigOptions(configx.WithValues(map[string]any{
+		config.KeyScopeStrategy:                 "DEPRECATED_HIERARCHICAL_SCOPE_STRATEGY",
+		config.KeyIssuerURL:                     "http://hydra.localhost",
+		config.KeySubjectTypesSupported:         []string{"pairwise", "public"},
+		config.KeyOIDCDiscoverySupportedClaims:  []string{"sub"},
+		config.KeyOAuth2ClientRegistrationURL:   "http://client-register/registration",
+		config.KeyOIDCDiscoveryUserinfoEndpoint: "/userinfo",
+	})))
+	t.Run(fmt.Sprintf("hsm_enabled=%v", reg.Config().HSMEnabled()), func(t *testing.T) {
+		testhelpers.MustEnsureRegistryKeys(t, reg, x.OpenIDConnectKeyName)
+
+		h := oauth2.NewHandler(reg)
+
+		r := httprouterx.NewRouterAdminWithPrefix()
+		h.SetPublicRoutes(r.ToPublic(), func(h http.Handler) http.Handler { return h })
+		h.SetAdminRoutes(r)
+		ts := httptest.NewServer(r)
+		defer ts.Close()
+
+		res, err := testhelpers.NewTestClient(t).Get(ts.URL + "/.well-known/oauth-authorization-server")
+		require.NoError(t, err)
+		defer func() { _ = res.Body.Close() }()
+
+		var wellKnownResp hydra.OidcConfiguration
+		err = json.NewDecoder(res.Body).Decode(&wellKnownResp)
+		require.NoError(t, err, "problem decoding wellknown json response: %+v", err)
+		snapshotOpts := []snapshotx.Opt{}
+		if reg.Config().HSMEnabled() {
+			// The signing algorithm is not stable in the HSM tests, because the key is kept
+			// in the HSM and persists across test runs.
+			snapshotOpts = append(snapshotOpts, snapshotx.ExceptPaths(
+				"id_token_signed_response_alg",
+				"id_token_signing_alg_values_supported",
+				"userinfo_signed_response_alg",
+				"userinfo_signing_alg_values_supported",
+			))
+		}
+		snapshotx.SnapshotT(t, wellKnownResp, snapshotOpts...)
+	})
 }

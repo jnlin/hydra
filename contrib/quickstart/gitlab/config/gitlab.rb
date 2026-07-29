@@ -1,3 +1,6 @@
+# Copyright © 2022 Ory Corp
+# SPDX-License-Identifier: Apache-2.0
+
 ## GitLab configuration settings
 ##! This file is generated during initial installation and **is not** modified
 ##! during upgrades.
@@ -67,7 +70,7 @@
 ### Request duration
 ###! Tells the rails application how long it has to complete a request
 ###! This value needs to be lower than the worker timeout set in unicorn/puma.
-###! By default, we'll allow 95% of the the worker timeout
+###! By default, we'll allow 95% of the worker timeout
 # gitlab_rails['max_request_duration_seconds'] = 57
 
 ### Email Settings
@@ -1304,7 +1307,7 @@ gitlab_rails['omniauth_providers'] = [
 #  "options" => {
 #    "stub_status" => "on", # Turn on stats
 #    "server_tokens" => "off", # Don't show the version of NGINX
-#    "access_log" => "off", # Disable logs for stats
+#    "request_log" => "off", # Disable logs for stats
 #    "allow" => "127.0.0.1", # Only allow access from localhost
 #    "deny" => "all" # Deny access to anyone else
 #  }

@@ -22,10 +22,9 @@ serve:
       exposed_headers:
         - Content-Type
       allow_credentials: true
-      options_passthrough: true
       max_age: 1
       debug: false
-    access_log:
+    request_log:
       disable_for_health: false
   admin:
     port: 2
@@ -46,10 +45,9 @@ serve:
       exposed_headers:
         - Content-Type
       allow_credentials: true
-      options_passthrough: true
       max_age: 1
       debug: false
-    access_log:
+    request_log:
       disable_for_health: false
   tls:
     key:
@@ -64,6 +62,9 @@ serve:
 
 dsn: memory
 
+hsm:
+  enabled: false
+
 webfinger:
   jwks:
     broadcast_keys:
@@ -73,6 +74,7 @@ webfinger:
     auth_url: https://example.com/auth
     token_url: https://example.com/token
     client_registration_url: https://example.com
+    device_authorization_url: https://example.com/device_authorization
     supported_claims:
       - username
     supported_scope:
@@ -86,6 +88,7 @@ oidc:
     pairwise:
       salt: random_salt
   dynamic_client_registration:
+    enabled: false
     default_scope:
       - whatever
 
@@ -93,10 +96,14 @@ urls:
   self:
     issuer: https://issuer
     public: https://public
+    admin: https://admin
   login: https://login
   consent: https://consent
   logout: https://logout
   error: https://error
+  device:
+    verification: https://device
+    success: https://device/callback
   post_logout_redirect: https://post_logout
 
 strategies:
@@ -109,13 +116,18 @@ ttl:
   refresh_token: 2h
   id_token: 2h
   auth_code: 2h
+  device_user_code: 2h
+  authentication_session: 24h
 
 oauth2:
   expose_internal_errors: true
-  include_legacy_error_fields: true
   hashers:
     bcrypt:
       cost: 20
+  device_authorization:
+    token_polling_interval: 2h
+    user_code:
+      entropy_preset: medium
   pkce:
     enforced: true
     enforced_for_public_clients: true
@@ -125,6 +137,8 @@ secrets:
     - some-random-system-secret
   cookie:
     - some-random-cookie-secret
+  pagination:
+    - some-random-pagination-secret
 
 profiling: cpu
 
@@ -134,10 +148,13 @@ tracing:
   providers:
     jaeger:
       local_agent_address: 127.0.0.1:6831
-      propagation: jaeger
       sampling:
-        type: const
-        value: 1
+        trace_id_ratio: 1
         server_url: http://sampling
     zipkin:
       server_url: http://zipkin/api/v2/spans
+    otlp:
+      insecure: true
+      server_url: localhost:4318
+      sampling:
+        sampling_ratio: 1.0

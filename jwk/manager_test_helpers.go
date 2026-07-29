@@ -1,22 +1,5 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package jwk
 
@@ -27,104 +10,226 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/x/errorsx"
-
+	"github.com/go-jose/go-jose/v3"
+	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	jose "gopkg.in/square/go-jose.v2"
+
+	"github.com/ory/x/assertx"
 )
 
 func RandomBytes(n int) ([]byte, error) {
 	bytes := make([]byte, n)
 	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
-		return []byte{}, errorsx.WithStack(err)
+		return []byte{}, errors.WithStack(err)
 	}
 	return bytes, nil
 }
 
 func canonicalizeThumbprints(js []jose.JSONWebKey) []jose.JSONWebKey {
 	for k, v := range js {
-		if len(v.CertificateThumbprintSHA1) == 0 {
-			v.CertificateThumbprintSHA1 = nil
-		}
-		if len(v.CertificateThumbprintSHA256) == 0 {
-			v.CertificateThumbprintSHA256 = nil
-		}
-		js[k] = v
+		js[k] = canonicalizeKeyThumbprints(&v)
 	}
 	return js
 }
 
-func TestHelperManagerKey(m Manager, keys *jose.JSONWebKeySet, suffix string) func(t *testing.T) {
-	pub := canonicalizeThumbprints(keys.Key("public:" + suffix))
-	priv := canonicalizeThumbprints(keys.Key("private:" + suffix))
+func canonicalizeKeyThumbprints(v *jose.JSONWebKey) jose.JSONWebKey {
+	if len(v.CertificateThumbprintSHA1) == 0 {
+		v.CertificateThumbprintSHA1 = nil
+	}
+	if len(v.CertificateThumbprintSHA256) == 0 {
+		v.CertificateThumbprintSHA256 = nil
+	}
+	return *v
+}
+
+func TestHelperManagerKey(m Manager, algo string, keys *jose.JSONWebKeySet, suffix string) func(t *testing.T) {
+	priv := canonicalizeThumbprints(keys.Key(suffix))
+	var pub []jose.JSONWebKey
+	for _, k := range priv {
+		pub = append(pub, canonicalizeThumbprints([]jose.JSONWebKey{k.Public()})...)
+	}
 
 	return func(t *testing.T) {
-		_, err := m.GetKey(context.TODO(), "faz", "baz")
+		ctx := t.Context()
+
+		set := algo + uuid.Must(uuid.NewV4()).String()
+
+		_, err := m.GetKey(ctx, set, suffix)
 		assert.NotNil(t, err)
 
-		err = m.AddKey(context.TODO(), "faz", First(priv))
+		err = m.AddKey(ctx, set, First(priv))
 		require.NoError(t, err)
 
-		got, err := m.GetKey(context.TODO(), "faz", "private:"+suffix)
+		got, err := m.GetKey(ctx, set, suffix)
 		require.NoError(t, err)
-		assert.Equal(t, priv, canonicalizeThumbprints(got.Keys))
+		assertx.EqualAsJSON(t, priv, canonicalizeThumbprints(got.Keys))
 
-		err = m.AddKey(context.TODO(), "faz", First(pub))
+		addKey := First(pub)
+		addKey.KeyID = uuid.Must(uuid.NewV4()).String()
+		err = m.AddKey(ctx, set, addKey)
 		require.NoError(t, err)
 
-		got, err = m.GetKey(context.TODO(), "faz", "private:"+suffix)
+		got, err = m.GetKey(ctx, set, suffix)
 		require.NoError(t, err)
-		assert.Equal(t, priv, canonicalizeThumbprints(got.Keys))
-
-		got, err = m.GetKey(context.TODO(), "faz", "public:"+suffix)
-		require.NoError(t, err)
-		assert.Equal(t, pub, canonicalizeThumbprints(got.Keys))
+		assertx.EqualAsJSON(t, priv, canonicalizeThumbprints(got.Keys))
 
 		// Because MySQL
 		time.Sleep(time.Second * 2)
 
-		First(pub).KeyID = "new-key-id:" + suffix
-		err = m.AddKey(context.TODO(), "faz", First(pub))
+		newKID := "new-key-id:" + suffix
+		pub[0].KeyID = newKID
+		pub[0].Use = "sig"
+		err = m.AddKey(ctx, set, First(pub))
 		require.NoError(t, err)
 
-		_, err = m.GetKey(context.TODO(), "faz", "new-key-id:"+suffix)
+		got, err = m.GetKey(ctx, set, newKID)
 		require.NoError(t, err)
+		newKey := First(got.Keys)
+		assert.EqualValues(t, "sig", newKey.Use)
 
-		keys, err = m.GetKeySet(context.TODO(), "faz")
+		newKey.Use = "enc"
+		err = m.UpdateKey(ctx, set, newKey)
 		require.NoError(t, err)
-		assert.EqualValues(t, "new-key-id:"+suffix, First(keys.Keys).KeyID)
+		updated, err := m.GetKey(ctx, set, newKID)
+		require.NoError(t, err)
+		updatedKey := First(updated.Keys)
+		assert.EqualValues(t, "enc", updatedKey.Use)
+
+		keys, err = m.GetKeySet(ctx, set)
+		require.NoError(t, err)
+		var found bool
+		for _, k := range keys.Keys {
+			if k.KeyID == newKID {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "Key not found in key set: %s / %s\n%+v", keys, newKID)
 
 		beforeDeleteKeysCount := len(keys.Keys)
-		err = m.DeleteKey(context.TODO(), "faz", "public:"+suffix)
+		err = m.DeleteKey(ctx, set, suffix)
 		require.NoError(t, err)
 
-		_, err = m.GetKey(context.TODO(), "faz", "public:"+suffix)
+		_, err = m.GetKey(ctx, set, suffix)
 		require.Error(t, err)
 
-		keys, err = m.GetKeySet(context.TODO(), "faz")
+		keys, err = m.GetKeySet(ctx, set)
 		require.NoError(t, err)
 		assert.EqualValues(t, beforeDeleteKeysCount-1, len(keys.Keys))
 	}
 }
 
-func TestHelperManagerKeySet(m Manager, keys *jose.JSONWebKeySet, suffix string) func(t *testing.T) {
+func TestHelperManagerKeySet(m Manager, algo string, keys *jose.JSONWebKeySet, suffix string, parallel bool) func(t *testing.T) {
 	return func(t *testing.T) {
-		_, err := m.GetKeySet(context.TODO(), "foo")
+		ctx := t.Context()
+
+		if parallel {
+			t.Parallel()
+		}
+		set := uuid.Must(uuid.NewV4()).String()
+		_, err := m.GetKeySet(ctx, algo+set)
 		require.Error(t, err)
 
-		err = m.AddKeySet(context.TODO(), "bar", keys)
+		err = m.AddKeySet(ctx, algo+set, keys)
 		require.NoError(t, err)
 
-		got, err := m.GetKeySet(context.TODO(), "bar")
+		got, err := m.GetKeySet(ctx, algo+set)
 		require.NoError(t, err)
-		assert.Equal(t, canonicalizeThumbprints(keys.Key("public:"+suffix)), canonicalizeThumbprints(got.Key("public:"+suffix)))
-		assert.Equal(t, canonicalizeThumbprints(keys.Key("private:"+suffix)), canonicalizeThumbprints(got.Key("private:"+suffix)))
+		assertx.EqualAsJSON(t, canonicalizeThumbprints(keys.Key(suffix)), canonicalizeThumbprints(got.Key(suffix)))
+		assertx.EqualAsJSON(t, canonicalizeThumbprints(keys.Key(suffix)), canonicalizeThumbprints(got.Key(suffix)))
 
-		err = m.DeleteKeySet(context.TODO(), "bar")
+		for i := range got.Keys {
+			got.Keys[i].Use = "enc"
+		}
+		err = m.UpdateKeySet(ctx, algo+set, got)
 		require.NoError(t, err)
 
-		_, err = m.GetKeySet(context.TODO(), "bar")
+		updated, err := m.GetKeySet(ctx, algo+set)
+		require.NoError(t, err)
+		assert.EqualValues(t, "enc", updated.Key(suffix)[0].Public().Use)
+		assert.EqualValues(t, "enc", updated.Key(suffix)[0].Use)
+
+		err = m.DeleteKeySet(ctx, algo+set)
+		require.NoError(t, err)
+
+		_, err = m.GetKeySet(ctx, algo+set)
 		require.Error(t, err)
+	}
+}
+
+func TestHelperManagerGenerateAndPersistKeySet(m Manager, alg string, parallel bool) func(t *testing.T) {
+	return func(t *testing.T) {
+		ctx := t.Context()
+
+		if parallel {
+			t.Parallel()
+		}
+		_, err := m.GetKeySet(ctx, "foo")
+		require.Error(t, err)
+
+		keys, err := m.GenerateAndPersistKeySet(ctx, "foo", "bar", alg, "sig")
+		require.NoError(t, err)
+		genPub, err := FindPublicKey(keys)
+		require.NoError(t, err)
+		require.NotEmpty(t, genPub)
+		genPriv, err := FindPrivateKey(keys)
+		require.NoError(t, err)
+
+		got, err := m.GetKeySet(ctx, "foo")
+		require.NoError(t, err)
+		gotPub, err := FindPublicKey(got)
+		require.NoError(t, err)
+		require.NotEmpty(t, gotPub)
+		gotPriv, err := FindPrivateKey(got)
+		require.NoError(t, err)
+
+		assertx.EqualAsJSON(t, canonicalizeKeyThumbprints(genPub), canonicalizeKeyThumbprints(gotPub))
+
+		assert.EqualValues(t, genPriv.KeyID, gotPriv.KeyID)
+
+		err = m.DeleteKeySet(ctx, "foo")
+		require.NoError(t, err)
+
+		_, err = m.GetKeySet(ctx, "foo")
+		require.Error(t, err)
+	}
+}
+
+func TestHelperNID(t1ValidNID, t2InvalidNID Manager) func(t *testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		jwks, err := GenerateJWK(jose.RS256, "2022-03-11-ks-1-kid", "test")
+		require.NoError(t, err)
+		require.Error(t, t2InvalidNID.AddKey(ctx, "2022-03-11-k-1", &jwks.Keys[0]))
+		require.NoError(t, t1ValidNID.AddKey(ctx, "2022-03-11-k-1", &jwks.Keys[0]))
+		require.Error(t, t2InvalidNID.AddKeySet(ctx, "2022-03-11-ks-1", jwks))
+		require.NoError(t, t1ValidNID.AddKeySet(ctx, "2022-03-11-ks-1", jwks))
+		require.NoError(t, t2InvalidNID.DeleteKey(ctx, "2022-03-11-ks-1", jwks.Keys[0].KeyID)) // Delete doesn't report error if key doesn't exist
+		require.NoError(t, t1ValidNID.DeleteKey(ctx, "2022-03-11-ks-1", jwks.Keys[0].KeyID))
+		_, err = t2InvalidNID.GenerateAndPersistKeySet(ctx, "2022-03-11-ks-2", "2022-03-11-ks-2-kid", "RS256", "sig")
+		require.Error(t, err)
+		gks2, err := t1ValidNID.GenerateAndPersistKeySet(ctx, "2022-03-11-ks-2", "2022-03-11-ks-2-kid", "RS256", "sig")
+		require.NoError(t, err)
+
+		_, err = t1ValidNID.GetKey(ctx, "2022-03-11-ks-2", gks2.Keys[0].KeyID)
+		require.NoError(t, err)
+		_, err = t2InvalidNID.GetKey(ctx, "2022-03-11-ks-2", gks2.Keys[0].KeyID)
+		require.Error(t, err)
+
+		_, err = t1ValidNID.GetKeySet(ctx, "2022-03-11-ks-2")
+		require.NoError(t, err)
+		_, err = t2InvalidNID.GetKeySet(ctx, "2022-03-11-ks-2")
+		require.Error(t, err)
+		updatedKey := &gks2.Keys[0]
+		updatedKey.Use = "enc"
+		require.Error(t, t2InvalidNID.UpdateKey(ctx, "2022-03-11-ks-2", updatedKey))
+		require.NoError(t, t1ValidNID.UpdateKey(ctx, "2022-03-11-ks-2", updatedKey))
+		gks2.Keys[0].Use = "enc"
+		require.Error(t, t2InvalidNID.UpdateKeySet(ctx, "2022-03-11-ks-2", gks2))
+		require.NoError(t, t1ValidNID.UpdateKeySet(ctx, "2022-03-11-ks-2", gks2))
+		require.NoError(t, t2InvalidNID.DeleteKeySet(ctx, "2022-03-11-ks-2"))
+		require.NoError(t, t1ValidNID.DeleteKeySet(ctx, "2022-03-11-ks-2"))
 	}
 }

@@ -1,95 +1,204 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package client
 
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/go-faker/faker/v4"
+	"github.com/go-jose/go-jose/v3"
+	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	jose "gopkg.in/square/go-jose.v2"
 
-	"github.com/ory/fosite"
+	"github.com/ory/x/uuidx"
 
-	"github.com/ory/hydra/x"
+	"github.com/ory/hydra/v2/fosite"
+	testhelpersuuid "github.com/ory/hydra/v2/internal/testhelpers/uuid"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
+	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
+	"github.com/ory/x/sqlcon"
 )
 
-func TestHelperClientAutoGenerateKey(k string, m Storage) func(t *testing.T) {
+func TestHelperClientAutoGenerateKey(m Storage) func(t *testing.T) {
 	return func(t *testing.T) {
 		ctx := context.TODO()
 		c := &Client{
-			OutfacingID:       "foo",
 			Secret:            "secret",
 			RedirectURIs:      []string{"http://redirect"},
 			TermsOfServiceURI: "foo",
 		}
-		assert.NoError(t, m.CreateClient(ctx, c))
-		// assert.NotEmpty(t, c.ID)
+		require.NoError(t, m.CreateClient(ctx, c))
+		dbClient, err := m.GetClient(ctx, c.GetID())
+		require.NoError(t, err)
+		dbClientConcrete, ok := dbClient.(*Client)
+		require.True(t, ok)
+		testhelpersuuid.AssertUUID(t, dbClientConcrete.ID)
 		assert.NoError(t, m.DeleteClient(ctx, c.GetID()))
 	}
 }
 
-func TestHelperClientAuthenticate(k string, m Manager) func(t *testing.T) {
+func TestHelperClientAuthenticate(m Manager) func(t *testing.T) {
 	return func(t *testing.T) {
 		ctx := context.TODO()
 		require.NoError(t, m.CreateClient(ctx, &Client{
-			OutfacingID:  "1234321",
+			ID:           "1234321",
 			Secret:       "secret",
 			RedirectURIs: []string{"http://redirect"},
 		}))
 
-		c, err := m.Authenticate(ctx, "1234321", []byte("secret1"))
-		require.NotNil(t, err)
+		c, err := m.AuthenticateClient(ctx, "1234321", []byte("secret1"))
+		require.Error(t, err)
+		require.Nil(t, c)
 
-		c, err = m.Authenticate(ctx, "1234321", []byte("secret"))
+		c, err = m.AuthenticateClient(ctx, "1234321", []byte("secret"))
 		require.NoError(t, err)
 		assert.Equal(t, "1234321", c.GetID())
 	}
 }
 
-func TestHelperUpdateTwoClients(_ string, m Manager) func(t *testing.T) {
+func TestHelperUpdateTwoClients(m Manager) func(t *testing.T) {
 	return func(t *testing.T) {
-		c1, c2 := &Client{OutfacingID: "klojdfc", Name: "test client 1"}, &Client{OutfacingID: "jlsdfkj", Name: "test client 2"}
+		c1, c2 := &Client{Name: "test client 1"}, &Client{Name: "test client 2"}
 
 		require.NoError(t, m.CreateClient(context.Background(), c1))
 		require.NoError(t, m.CreateClient(context.Background(), c2))
 
-		c1.Name, c2.Name = "updated klojdfc client 1", "updated klojdfc client 2"
+		c1.Name, c2.Name = "updated client 1", "updated client 2"
 
 		assert.NoError(t, m.UpdateClient(context.Background(), c1))
 		assert.NoError(t, m.UpdateClient(context.Background(), c2))
 	}
 }
 
-func TestHelperCreateGetUpdateDeleteClient(k string, m Storage) func(t *testing.T) {
+func testHelperUpdateClient(t *testing.T, ctx context.Context, store Storage, toUpdate *Client) {
+	require.NoError(t, store.UpdateClient(ctx, &Client{
+		ID:                toUpdate.ID,
+		Name:              "name-new",
+		Secret:            "secret-new",
+		RedirectURIs:      []string{"http://redirect/new"},
+		TermsOfServiceURI: "bar",
+		JSONWebKeys:       new(x.JoseJSONWebKeySet),
+	}))
+
+	nc, err := store.GetConcreteClient(ctx, toUpdate.ID)
+	require.NoError(t, err)
+
+	require.NotZero(t, toUpdate.GetHashedSecret())
+	require.NotZero(t, nc.GetHashedSecret())
+	assert.NotEqual(t, toUpdate.GetHashedSecret(), nc.GetHashedSecret(), "ensure that the secret hash was updated")
+
+	assert.Equal(t, "bar", nc.TermsOfServiceURI)
+	assert.Equal(t, "name-new", nc.Name)
+	assert.Equal(t, []string{"http://redirect/new"}, nc.GetRedirectURIs())
+	assert.Len(t, nc.Contacts, 0)
+}
+
+func TestHelperCreateGetUpdateDeleteClientNext(t *testing.T, m Storage, networks []uuid.UUID) {
+	ctx := context.Background()
+
+	resources := map[uuid.UUID][]Client{}
+	for k := range networks {
+		nid := networks[k]
+		resources[nid] = []Client{}
+
+		ctx := contextx.SetNIDContext(ctx, nid)
+		t.Run(fmt.Sprintf("nid=%s", nid), func(t *testing.T) {
+			var client Client
+			require.NoError(t, faker.FakeData(&client))
+			client.CreatedAt = time.Now().Truncate(time.Second).UTC()
+
+			t.Run("lifecycle=does not exist", func(t *testing.T) {
+				_, err := m.GetClient(ctx, uuidx.NewV4().String())
+				require.Error(t, err)
+			})
+
+			t.Run("lifecycle=exists", func(t *testing.T) {
+				require.NoError(t, m.CreateClient(ctx, &client))
+				c, err := m.GetClient(ctx, client.GetID())
+				require.NoError(t, err)
+				assertx.EqualAsJSONExcept(t, &client, c, []string{
+					"registration_access_token",
+					"registration_client_uri",
+					"updated_at",
+				})
+
+				require.ErrorIs(t, m.CreateClient(ctx, &client), sqlcon.ErrUniqueViolation())
+			})
+
+			t.Run("lifecycle=update", func(t *testing.T) {
+				client.Name = "updated" + nid.String()
+				require.NoError(t, m.UpdateClient(ctx, &client))
+				c, err := m.GetClient(ctx, client.GetID())
+				require.NoError(t, err)
+				assertx.EqualAsJSONExcept(t, &client, c, []string{
+					"registration_access_token",
+					"registration_client_uri",
+					"updated_at",
+				})
+				resources[nid] = append(resources[nid], client)
+			})
+		})
+	}
+
+	for k := range resources {
+		original := k
+		clients := resources[k]
+		for i := range networks {
+			check := networks[i]
+
+			t.Run("network="+original.String(), func(t *testing.T) {
+				ctx := contextx.SetNIDContext(ctx, check)
+				for _, expected := range clients {
+					c, err := m.GetClient(ctx, expected.GetID())
+					if check != original {
+						t.Run(fmt.Sprintf("case=must not find client %s", expected.GetID()), func(t *testing.T) {
+							require.ErrorIs(t, err, sqlcon.ErrNoRows())
+						})
+					} else {
+						t.Run("case=updates must not override each other", func(t *testing.T) {
+							require.NoError(t, err)
+							assert.Equal(t, "updated"+original.String(), c.(*Client).Name)
+						})
+					}
+				}
+			})
+		}
+	}
+
+	for k := range resources {
+		clients := resources[k]
+		ctx := contextx.SetNIDContext(ctx, k)
+		t.Run("network="+k.String(), func(t *testing.T) {
+			for _, client := range clients {
+				t.Run("lifecycle=cleanup", func(t *testing.T) {
+					assert.NoError(t, m.DeleteClient(ctx, client.GetID()))
+
+					_, err := m.GetClient(ctx, client.GetID())
+					assert.ErrorIs(t, err, sqlcon.ErrNoRows())
+
+					assert.ErrorIs(t, m.DeleteClient(ctx, client.GetID()), sqlcon.ErrNoRows())
+				})
+			}
+		})
+	}
+}
+
+func TestHelperCreateGetUpdateDeleteClient(t1, t2 Storage) func(t *testing.T) {
 	return func(t *testing.T) {
 		ctx := context.Background()
-		_, err := m.GetClient(ctx, "1234")
+		_, err := t1.GetClient(ctx, "1234")
 		require.Error(t, err)
 
-		c := &Client{
-			OutfacingID:                       "1234",
+		t1c1 := &Client{
+			ID:                                uuidx.NewV4().String(),
 			Name:                              "name",
 			Secret:                            "secret",
 			RedirectURIs:                      []string{"http://redirect", "http://redirect1"},
@@ -121,81 +230,128 @@ func TestHelperCreateGetUpdateDeleteClient(k string, m Storage) func(t *testing.
 			BackChannelLogoutSessionRequired:  true,
 		}
 
-		require.NoError(t, m.CreateClient(ctx, c))
-		assert.Equal(t, c.GetID(), "1234")
-		if k != "http" {
-			assert.NotEmpty(t, c.GetHashedSecret())
+		require.NoError(t, t1.CreateClient(ctx, t1c1))
+		assert.NotEmpty(t, t1c1.GetHashedSecret())
+
+		t2c1 := *t1c1
+		require.NoError(t, t2.CreateClient(ctx, &t2c1), "we should be able to create a client with the same ID in other network")
+
+		t2c3 := *t1c1
+		{
+			t2c3.ID = uuidx.NewV4().String()
+			require.NoError(t, t2.CreateClient(ctx, &t2c3))
+			require.ErrorIs(t, t2.CreateClient(ctx, &t2c3), sqlcon.ErrUniqueViolation())
 		}
 
-		assert.NoError(t, m.CreateClient(ctx, &Client{
-			OutfacingID:       "2-1234",
-			Name:              "name",
+		c2Template := &Client{
+			ID:                uuidx.NewV4().String(),
+			Name:              "name2",
 			Secret:            "secret",
 			RedirectURIs:      []string{"http://redirect"},
 			TermsOfServiceURI: "foo",
 			SecretExpiresAt:   1,
-		}))
-
-		d, err := m.GetClient(ctx, "1234")
-		require.NoError(t, err)
-
-		compare(t, c, d, k)
-
-		ds, err := m.GetClients(ctx, 100, 0)
-		assert.NoError(t, err)
-		assert.Len(t, ds, 2)
-		assert.NotEqual(t, ds[0].OutfacingID, ds[1].OutfacingID)
-		assert.NotEqual(t, ds[0].OutfacingID, ds[1].OutfacingID)
-		// test if SecretExpiresAt was set properly
-		assert.Equal(t, ds[0].SecretExpiresAt, 0)
-		assert.Equal(t, ds[1].SecretExpiresAt, 1)
-
-		ds, err = m.GetClients(ctx, 1, 0)
-		assert.NoError(t, err)
-		assert.Len(t, ds, 1)
-
-		ds, err = m.GetClients(ctx, 100, 100)
-		assert.NoError(t, err)
-
-		err = m.UpdateClient(ctx, &Client{
-			OutfacingID:       "2-1234",
-			Name:              "name-new",
-			Secret:            "secret-new",
-			RedirectURIs:      []string{"http://redirect/new"},
-			TermsOfServiceURI: "bar",
-			JSONWebKeys:       new(x.JoseJSONWebKeySet),
-		})
-		require.NoError(t, err)
-
-		nc, err := m.GetConcreteClient(ctx, "2-1234")
-		require.NoError(t, err)
-
-		if k != "http" {
-			// http always returns an empty secret
-			assert.NotEqual(t, d.GetHashedSecret(), nc.GetHashedSecret())
 		}
-		assert.Equal(t, "bar", nc.TermsOfServiceURI)
-		assert.Equal(t, "name-new", nc.Name)
-		assert.EqualValues(t, []string{"http://redirect/new"}, nc.GetRedirectURIs())
-		assert.Zero(t, len(nc.Contacts))
+		assert.NoError(t, t1.CreateClient(ctx, c2Template))
+		assert.NoError(t, t2.CreateClient(ctx, c2Template))
 
-		err = m.DeleteClient(ctx, "1234")
-		assert.NoError(t, err)
+		d, err := t1.GetClient(ctx, t1c1.ID)
+		require.NoError(t, err)
 
-		_, err = m.GetClient(ctx, "1234")
-		assert.NotNil(t, err)
+		cc := d.(*Client)
+		testhelpersuuid.AssertUUID(t, cc.NID)
 
-		n, err := m.CountClients(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, 1, n)
+		compare(t, t1c1, d)
+
+		t.Run("list all", func(t *testing.T) {
+			cs, nextPage, err := t1.GetClients(ctx, Filter{})
+			require.NoError(t, err)
+			require.Len(t, cs, 2)
+			assert.ElementsMatch(t, []string{t1c1.ID, c2Template.ID}, []string{cs[0].GetID(), cs[1].GetID()})
+			// test if SecretExpiresAt was set properly
+			assert.ElementsMatch(t, []int{0, 1}, []int{cs[0].SecretExpiresAt, cs[1].SecretExpiresAt})
+			assert.True(t, nextPage.IsLast())
+		})
+
+		t.Run("pagination", func(t *testing.T) {
+			observedIDs := make([]string, 2)
+
+			cs, nextPage, err := t1.GetClients(ctx, Filter{PageOpts: []keysetpagination.Option{keysetpagination.WithSize(1)}})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.False(t, nextPage.IsLast())
+			observedIDs[0] = cs[0].ID
+
+			cs, nextPage, err = t1.GetClients(ctx, Filter{PageOpts: nextPage.ToOptions()})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.True(t, nextPage.IsLast())
+			observedIDs[1] = cs[0].ID
+
+			assert.ElementsMatch(t, []string{t1c1.ID, c2Template.ID}, observedIDs)
+		})
+
+		t.Run("list by name", func(t *testing.T) {
+			cs, nextPage, err := t1.GetClients(ctx, Filter{Name: "name"})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.Equal(t, cs[0].Name, "name")
+			assert.True(t, nextPage.IsLast())
+		})
+
+		t.Run("list by unknown name", func(t *testing.T) {
+			cs, nextPage, err := t1.GetClients(ctx, Filter{Name: "bad name"})
+			require.NoError(t, err)
+			assert.Len(t, cs, 0)
+			assert.True(t, nextPage.IsLast())
+		})
+
+		t.Run("list by owner", func(t *testing.T) {
+			cs, nextPage, err := t1.GetClients(ctx, Filter{Owner: "aeneas"})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.Equal(t, cs[0].Owner, "aeneas")
+			assert.True(t, nextPage.IsLast())
+		})
+
+		t.Run("list by ids", func(t *testing.T) {
+			cs, nextPage, err := t1.GetClients(ctx, Filter{IDs: []string{t1c1.ID, c2Template.ID}})
+			require.NoError(t, err)
+			require.Len(t, cs, 2)
+			assert.ElementsMatch(t, []string{t1c1.ID, c2Template.ID}, []string{cs[0].GetID(), cs[1].GetID()})
+			assert.True(t, nextPage.IsLast())
+
+			cs, nextPage, err = t1.GetClients(ctx, Filter{IDs: []string{t1c1.ID}})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.Equal(t, t1c1.ID, cs[0].GetID())
+			assert.True(t, nextPage.IsLast())
+
+			cs, nextPage, err = t1.GetClients(ctx, Filter{IDs: []string{c2Template.ID}})
+			require.NoError(t, err)
+			require.Len(t, cs, 1)
+			assert.Equal(t, c2Template.ID, cs[0].GetID())
+			assert.True(t, nextPage.IsLast())
+
+			cs, nextPage, err = t1.GetClients(ctx, Filter{IDs: []string{uuidx.NewV4().String()}})
+			require.NoError(t, err)
+			require.Len(t, cs, 0)
+			assert.True(t, nextPage.IsLast())
+		})
+
+		testHelperUpdateClient(t, ctx, t1, t1c1)
+		testHelperUpdateClient(t, ctx, t2, &t2c1)
+
+		assert.ErrorIs(t, t1.DeleteClient(ctx, t2c3.ID), sqlcon.ErrNoRows())
+
+		assert.NoError(t, t1.DeleteClient(ctx, t1c1.ID))
+		_, err = t1.GetClient(ctx, t1c1.ID)
+		assert.ErrorIs(t, err, sqlcon.ErrNoRows())
 	}
 }
 
-func compare(t *testing.T, expected *Client, actual fosite.Client, k string) {
+func compare(t *testing.T, expected *Client, actual fosite.Client) {
 	assert.EqualValues(t, expected.GetID(), actual.GetID())
-	if k != "http" {
-		assert.EqualValues(t, expected.GetHashedSecret(), actual.GetHashedSecret())
-	}
+	assert.EqualValues(t, expected.GetHashedSecret(), actual.GetHashedSecret())
 	assert.EqualValues(t, expected.GetRedirectURIs(), actual.GetRedirectURIs())
 	assert.EqualValues(t, expected.GetGrantTypes(), actual.GetGrantTypes())
 
@@ -215,7 +371,7 @@ func compare(t *testing.T, expected *Client, actual fosite.Client, k string) {
 		assert.EqualValues(t, expected.SectorIdentifierURI, actual.SectorIdentifierURI)
 		assert.EqualValues(t, expected.UserinfoSignedResponseAlg, actual.UserinfoSignedResponseAlg)
 		assert.EqualValues(t, expected.CreatedAt.UTC().Unix(), actual.CreatedAt.UTC().Unix())
-		// these values are not the same because of https://github.com/gobuffalo/pop/issues/591
+		// these values are not the same because of https://github.com/ory/pop/issues/591
 		//assert.EqualValues(t, expected.UpdatedAt.UTC().Unix(), actual.UpdatedAt.UTC().Unix(), "%s\n%s", expected.UpdatedAt.String(), actual.UpdatedAt.String())
 		assert.EqualValues(t, expected.FrontChannelLogoutURI, actual.FrontChannelLogoutURI)
 		assert.EqualValues(t, expected.FrontChannelLogoutSessionRequired, actual.FrontChannelLogoutSessionRequired)

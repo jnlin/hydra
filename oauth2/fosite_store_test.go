@@ -1,73 +1,22 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package oauth2_test
 
 import (
-	"context"
-	"flag"
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/require"
-
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/driver"
-	"github.com/ory/hydra/driver/config"
-	"github.com/ory/hydra/internal"
-	. "github.com/ory/hydra/oauth2"
-	"github.com/ory/x/sqlcon/dockertest"
+	"github.com/ory/hydra/v2/driver"
+	"github.com/ory/hydra/v2/driver/config"
+	"github.com/ory/hydra/v2/internal/testhelpers"
+	"github.com/ory/x/configx"
 )
 
-func TestMain(m *testing.M) {
-	flag.Parse()
-
-	runner := dockertest.Register()
-	runner.Exit(m.Run())
-}
-
-var registries = make(map[string]driver.Registry)
-var cleanRegistries = func(t *testing.T) {
-	registries["memory"] = internal.NewRegistryMemory(t, internal.NewConfigurationWithDefaults())
-}
-
-// returns clean registries that can safely be used for one test
-// to reuse call cleanRegistries
-func setupRegistries(t *testing.T) {
-	if len(registries) == 0 && !testing.Short() {
-		// first time called and sql tests
-		var cleanSQL func(*testing.T)
-		registries["postgres"], registries["mysql"], registries["cockroach"], cleanSQL = internal.ConnectDatabases(t)
-		cleanMem := cleanRegistries
-		cleanMem(t)
-		cleanRegistries = func(t *testing.T) {
-			cleanMem(t)
-			cleanSQL(t)
-		}
-	} else {
-		// reset all/init mem
-		cleanRegistries(t)
-	}
-}
-
 func TestManagers(t *testing.T) {
-	tests := []struct {
+	t.Parallel()
+
+	for _, tc := range []struct {
 		name                   string
 		enableSessionEncrypted bool
 	}{
@@ -79,17 +28,44 @@ func TestManagers(t *testing.T) {
 			name:                   "EnableSessionEncrypted",
 			enableSessionEncrypted: true,
 		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			setupRegistries(t)
-			require.NoError(t, registries["memory"].ClientManager().CreateClient(context.Background(), &client.Client{OutfacingID: "foobar"})) // this is a workaround because the client is not being created for memory store by test helpers.
+	} {
+		t.Run("suite="+tc.name, func(t *testing.T) {
+			for k, store := range testhelpers.ConnectDatabases(t, true, driver.WithConfigOptions(configx.WithValue(config.KeyEncryptSessionData, tc.enableSessionEncrypted))) {
+				t.Run("database="+k, func(t *testing.T) {
+					if k != "memory" {
+						t.Run("testHelperUniqueConstraints", testHelperRequestIDMultiples(store, k))
+						t.Run("case=testFositeSqlStoreTransactionsCommitAccessToken", testFositeSqlStoreTransactionCommitAccessToken(store))
+						t.Run("case=testFositeSqlStoreTransactionsRollbackAccessToken", testFositeSqlStoreTransactionRollbackAccessToken(store))
+						t.Run("case=testFositeSqlStoreTransactionCommitRefreshToken", testFositeSqlStoreTransactionCommitRefreshToken(store))
+						t.Run("case=testFositeSqlStoreTransactionRollbackRefreshToken", testFositeSqlStoreTransactionRollbackRefreshToken(store))
+						t.Run("case=testFositeSqlStoreTransactionCommitAuthorizeCode", testFositeSqlStoreTransactionCommitAuthorizeCode(store))
+						t.Run("case=testFositeSqlStoreTransactionRollbackAuthorizeCode", testFositeSqlStoreTransactionRollbackAuthorizeCode(store))
+						t.Run("case=testFositeSqlStoreTransactionCommitPKCERequest", testFositeSqlStoreTransactionCommitPKCERequest(store))
+						t.Run("case=testFositeSqlStoreTransactionRollbackPKCERequest", testFositeSqlStoreTransactionRollbackPKCERequest(store))
+						t.Run("case=testFositeSqlStoreTransactionCommitOpenIdConnectSession", testFositeSqlStoreTransactionCommitOpenIdConnectSession(store))
+						t.Run("case=testFositeSqlStoreTransactionRollbackOpenIdConnectSession", testFositeSqlStoreTransactionRollbackOpenIdConnectSession(store))
+					}
 
-			for k, store := range registries {
-				store.Config().MustSet(config.KeyEncryptSessionData, tc.enableSessionEncrypted)
-				TestHelperRunner(t, store, k)
+					t.Run("testHelperCreateGetDeleteAuthorizeCodes", testHelperCreateGetDeleteAuthorizeCodes(store))
+					t.Run("testHelperExpiryFields", testHelperExpiryFields(store))
+					t.Run("testHelperCreateGetDeleteAccessTokenSession", testHelperCreateGetDeleteAccessTokenSession(store))
+					t.Run("testHelperNilAccessToken", testHelperNilAccessToken(store))
+					t.Run("testHelperCreateGetDeleteOpenIDConnectSession", testHelperCreateGetDeleteOpenIDConnectSession(store))
+					t.Run("testHelperCreateGetDeleteRefreshTokenSession", testHelperCreateGetDeleteRefreshTokenSession(store))
+					t.Run("testHelperRevokeRefreshToken", testHelperRevokeRefreshToken(store))
+					t.Run("testHelperCreateGetDeletePKCERequestSession", testHelperCreateGetDeletePKCERequestSession(store))
+					t.Run("testHelperFlushTokens", testHelperFlushTokens(store, time.Hour))
+					t.Run("testHelperFlushTokensWithLimitAndBatchSize", testHelperFlushTokensWithLimitAndBatchSize(store, 3, 2))
+					t.Run("testFositeStoreSetClientAssertionJWT", testFositeStoreSetClientAssertionJWT(store))
+					t.Run("testFositeStoreClientAssertionJWTValid", testFositeStoreClientAssertionJWTValid(store))
+					t.Run("testHelperDeleteAccessTokens", testHelperDeleteAccessTokens(store))
+					t.Run("testHelperRevokeAccessToken", testHelperRevokeAccessToken(store))
+					t.Run("testFositeJWTBearerGrantStorage", testFositeJWTBearerGrantStorage(store))
+					t.Run("testHelperRotateRefreshToken", testHelperRotateRefreshToken(store))
+					t.Run("testHelperRefreshTokenExpiryUpdate", testHelperRefreshTokenExpiryUpdate(store))
+					t.Run("testHelperAuthorizeCodeInvalidation", testHelperAuthorizeCodeInvalidation(store))
+				})
 			}
 		})
-
 	}
 }

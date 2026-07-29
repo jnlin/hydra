@@ -1,16 +1,21 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package internal
 
 import (
-	"context"
+	"testing"
 
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/driver"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/driver"
 )
 
-func AddFositeExamples(r driver.Registry) {
+func AddFositeExamples(t *testing.T, r *driver.RegistrySQL) {
 	for _, c := range []client.Client{
 		{
-			OutfacingID:   "my-client",
+			ID:            "my-client",
 			Secret:        "foobar",
 			RedirectURIs:  []string{"http://localhost:3846/callback"},
 			ResponseTypes: []string{"id_token", "code", "token"},
@@ -18,7 +23,7 @@ func AddFositeExamples(r driver.Registry) {
 			Scope:         "fosite,openid,photos,offline",
 		},
 		{
-			OutfacingID:   "encoded:client",
+			ID:            "encoded:client",
 			Secret:        "encoded&password",
 			RedirectURIs:  []string{"http://localhost:3846/callback"},
 			ResponseTypes: []string{"id_token", "code", "token"},
@@ -27,8 +32,6 @@ func AddFositeExamples(r driver.Registry) {
 		},
 	} {
 		// #nosec G601
-		if err := r.ClientManager().CreateClient(context.Background(), &c); err != nil {
-			panic(err)
-		}
+		require.NoError(t, r.ClientManager().CreateClient(t.Context(), &c))
 	}
 }

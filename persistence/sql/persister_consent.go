@@ -1,3 +1,6 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package sql
 
 import (
@@ -6,104 +9,177 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ory/x/sqlxx"
-
-	"github.com/ory/x/errorsx"
-
-	"github.com/gobuffalo/pop/v5"
+	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
-	"github.com/ory/fosite"
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/consent"
-	"github.com/ory/hydra/x"
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/consent"
+	"github.com/ory/hydra/v2/flow"
+	"github.com/ory/hydra/v2/fosite"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/pop/v6"
+	"github.com/ory/x/otelx"
+	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
+	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/sqlxx"
 )
 
-var _ consent.Manager = &Persister{}
+var (
+	_ consent.Manager                  = (*ConsentPersister)(nil)
+	_ consent.LoginManager             = (*Persister)(nil)
+	_ consent.LogoutManager            = (*Persister)(nil)
+	_ consent.ObfuscatedSubjectManager = (*Persister)(nil)
+)
 
-func (p *Persister) RevokeSubjectConsentSession(ctx context.Context, user string) error {
-	return p.transaction(ctx, p.revokeConsentSession("r.subject = ?", user))
+type ConsentPersister struct {
+	*BasePersister
 }
 
-func (p *Persister) RevokeSubjectClientConsentSession(ctx context.Context, user, client string) error {
-	return p.transaction(ctx, p.revokeConsentSession("r.subject = ? AND r.client_id = ?", user, client))
+func (p *ConsentPersister) RevokeSubjectConsentSession(ctx context.Context, user string) (err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.RevokeSubjectConsentSession")
+	defer otelx.End(span, &err)
+
+	return p.Transaction(ctx, p.revokeConsentSession("consent_challenge_id IS NOT NULL AND subject = ?", user))
 }
 
-func (p *Persister) revokeConsentSession(whereStmt string, whereArgs ...interface{}) func(context.Context, *pop.Connection) error {
+func (p *ConsentPersister) RevokeSubjectClientConsentSession(ctx context.Context, user, clientID string) (err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.RevokeSubjectClientConsentSession", trace.WithAttributes(attribute.String("client.id", clientID)))
+	defer otelx.End(span, &err)
+
+	return p.Transaction(ctx, p.revokeConsentSession("consent_challenge_id IS NOT NULL AND subject = ? AND client_id = ?", user, clientID))
+}
+
+func (p *ConsentPersister) RevokeConsentSessionByID(ctx context.Context, consentRequestID string) (err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.RevokeConsentSessionByID",
+		trace.WithAttributes(attribute.String("consent_challenge_id", consentRequestID)))
+	defer otelx.End(span, &err)
+
+	return p.Transaction(ctx, p.revokeConsentSession("consent_challenge_id = ?", consentRequestID))
+}
+
+func (p *ConsentPersister) revokeConsentSession(whereStmt string, whereArgs ...interface{}) func(context.Context, *pop.Connection) error {
 	return func(ctx context.Context, c *pop.Connection) error {
-		hrs := make([]*consent.HandledConsentRequest, 0)
-		if err := c.
+		fs := make([]*flow.Flow, 0)
+		if err := p.QueryWithNetwork(ctx).
 			Where(whereStmt, whereArgs...).
-			Select("r.challenge").
-			Join(
-				fmt.Sprintf("%s AS r", consent.ConsentRequest{}.TableName()),
-				fmt.Sprintf("r.challenge = %s.challenge", consent.HandledConsentRequest{}.TableName())).
-			All(&hrs); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return errorsx.WithStack(x.ErrNotFound)
-			}
-
+			Select("consent_challenge_id").
+			All(&fs); errors.Is(err, sql.ErrNoRows) {
+			return errors.WithStack(x.ErrNotFound)
+		} else if err != nil {
 			return sqlcon.HandleError(err)
 		}
 
-		var count int
-		for _, hr := range hrs {
-			if err := p.RevokeAccessToken(ctx, hr.ID); errors.Is(err, fosite.ErrNotFound) {
-				// do nothing
-			} else if err != nil {
-				return err
-			}
-
-			if err := p.RevokeRefreshToken(ctx, hr.ID); errors.Is(err, fosite.ErrNotFound) {
-				// do nothing
-			} else if err != nil {
-				return err
-			}
-
-			// Since we ON DELETE CASCADE, hydra_oauth2_consent_request_handled will be removed automagically.
-			localCount, err := c.RawQuery("DELETE FROM hydra_oauth2_consent_request WHERE challenge = ?", hr.ID).ExecWithCount()
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return errorsx.WithStack(x.ErrNotFound)
-				}
-				return sqlcon.HandleError(err)
-			}
-
-			// If there are no sessions to revoke we should return an error to indicate to the caller
-			// that the request failed.
-			count += localCount
+		ids := make([]interface{}, 0, len(fs))
+		nid := p.NetworkID(ctx)
+		for _, f := range fs {
+			ids = append(ids, f.ConsentRequestID.String())
 		}
 
-		if count == 0 {
-			return errorsx.WithStack(x.ErrNotFound)
+		if len(ids) == 0 {
+			return nil
+		}
+
+		if err := p.QueryWithNetwork(ctx).
+			Where("nid = ?", nid).
+			Where("request_id IN (?)", ids...).
+			Delete(OAuth2RequestSQL{Table: sqlTableAccess}.TableName()); errors.Is(err, fosite.ErrNotFound) {
+			// do nothing
+		} else if err != nil {
+			return err
+		}
+
+		if err := p.QueryWithNetwork(ctx).
+			Where("nid = ?", nid).
+			Where("request_id IN (?)", ids...).
+			Delete(OAuth2RefreshTable{}.TableName()); errors.Is(err, fosite.ErrNotFound) {
+			// do nothing
+		} else if err != nil {
+			return err
+		}
+
+		if err := p.QueryWithNetwork(ctx).
+			Where("nid = ?", nid).
+			Where("consent_challenge_id IN (?)", ids...).
+			Delete(new(flow.Flow)); errors.Is(err, sql.ErrNoRows) {
+			return errors.WithStack(x.ErrNotFound)
+		} else if err != nil {
+			return sqlcon.HandleError(err)
 		}
 
 		return nil
 	}
 }
 
-func (p *Persister) RevokeSubjectLoginSession(ctx context.Context, subject string) error {
-	if err := p.Connection(ctx).RawQuery("DELETE FROM hydra_oauth2_authentication_session WHERE subject = ?", subject).Exec(); errors.Is(err, sql.ErrNoRows) {
-		return errorsx.WithStack(x.ErrNotFound)
-	} else if err != nil {
-		return sqlcon.HandleError(err)
+// RevokeSubjectLoginSessionBatchSize bounds how many login sessions a single
+// RevokeSubjectLoginSession DELETE removes per statement, so the ON DELETE SET
+// NULL cascade into hydra_oauth2_flow stays well under CockroachDB's
+// per-transaction intent budget (kv.transaction.max_intents_bytes). It is a var
+// (not a const) only so tests can lower it to exercise multi-batch behavior.
+var RevokeSubjectLoginSessionBatchSize = 100
+
+func (p *Persister) RevokeSubjectLoginSession(ctx context.Context, subject string) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.RevokeSubjectLoginSession")
+	defer otelx.End(span, &err)
+
+	nid := p.NetworkID(ctx)
+	total := 0
+	batches := 0
+	for {
+		// Honor the caller's deadline/cancellation between batches. Already
+		// committed batches stay deleted; the caller can retry to finish.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WithStack(ctxErr)
+		}
+
+		// The nested SELECT is required because our MySQL version does not
+		// support LIMIT in an IN/ANY subquery. This form is portable across all
+		// supported dialects; the inner SELECT is served by the (subject, nid)
+		// index. The outer DELETE repeats the nid filter as defense in depth so
+		// the network boundary is enforced on the delete target itself, matching
+		// QueryWithNetwork.
+		var deleted int
+		/* #nosec G201 - RevokeSubjectLoginSessionBatchSize is a package-level integer variable, not user input. */
+		deleted, err = p.Connection(ctx).RawQuery(
+			fmt.Sprintf(`DELETE FROM hydra_oauth2_authentication_session WHERE nid = ? AND id IN (
+				SELECT id FROM (
+					SELECT id FROM hydra_oauth2_authentication_session WHERE nid = ? AND subject = ? LIMIT %d
+				) AS s
+			)`, RevokeSubjectLoginSessionBatchSize),
+			nid, nid, subject,
+		).ExecWithCount()
+		if err != nil {
+			return sqlcon.HandleError(err)
+		}
+
+		total += deleted
+		batches++
+		p.l.Debugf("Revoking subject login sessions: %d deleted so far", total)
+
+		if deleted < RevokeSubjectLoginSessionBatchSize {
+			break // Last partial batch -> the subject is fully drained.
+		}
 	}
 
-	// This confuses people, see https://github.com/ory/hydra/issues/1168
-	//
-	// count, _ := rows.RowsAffected()
-	// if count == 0 {
-	// 	 return errorsx.WithStack(x.ErrNotFound)
-	// }
+	span.SetAttributes(
+		attribute.Int("rows_deleted", total),
+		attribute.Int("batches", batches),
+	)
 
 	return nil
 }
 
-func (p *Persister) CreateForcedObfuscatedLoginSession(ctx context.Context, session *consent.ForcedObfuscatedLoginSession) error {
-	return p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
+func (p *Persister) CreateForcedObfuscatedLoginSession(ctx context.Context, session *consent.ForcedObfuscatedLoginSession) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateForcedObfuscatedLoginSession")
+	defer otelx.End(span, &err)
+
+	return p.Transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
+		nid := p.NetworkID(ctx)
 		if err := c.RawQuery(
-			"DELETE FROM hydra_oauth2_obfuscated_authentication_session WHERE client_id = ? AND subject = ?",
+			"DELETE FROM hydra_oauth2_obfuscated_authentication_session WHERE nid = ? AND client_id = ? AND subject = ?",
+			nid,
 			session.ClientID,
 			session.Subject,
 		).Exec(); err != nil {
@@ -111,7 +187,8 @@ func (p *Persister) CreateForcedObfuscatedLoginSession(ctx context.Context, sess
 		}
 
 		return sqlcon.HandleError(c.RawQuery(
-			"INSERT INTO hydra_oauth2_obfuscated_authentication_session (subject, client_id, subject_obfuscated) VALUES (?, ?, ?)",
+			"INSERT INTO hydra_oauth2_obfuscated_authentication_session (nid, subject, client_id, subject_obfuscated) VALUES (?, ?, ?, ?)",
+			nid,
 			session.Subject,
 			session.ClientID,
 			session.SubjectObfuscated,
@@ -119,15 +196,19 @@ func (p *Persister) CreateForcedObfuscatedLoginSession(ctx context.Context, sess
 	})
 }
 
-func (p *Persister) GetForcedObfuscatedLoginSession(ctx context.Context, client, obfuscated string) (*consent.ForcedObfuscatedLoginSession, error) {
+func (p *Persister) GetForcedObfuscatedLoginSession(ctx context.Context, clientID, obfuscated string) (_ *consent.ForcedObfuscatedLoginSession, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.GetForcedObfuscatedLoginSession", trace.WithAttributes(attribute.String("client.id", clientID)))
+	defer otelx.End(span, &err)
+
 	var s consent.ForcedObfuscatedLoginSession
 
 	if err := p.Connection(ctx).Where(
-		"client_id = ? AND subject_obfuscated = ?",
-		client,
+		"client_id = ? AND subject_obfuscated = ? AND nid = ?",
+		clientID,
 		obfuscated,
+		p.NetworkID(ctx),
 	).First(&s); errors.Is(err, sql.ErrNoRows) {
-		return nil, errorsx.WithStack(x.ErrNotFound)
+		return nil, errors.WithStack(x.ErrNotFound)
 	} else if err != nil {
 		return nil, sqlcon.HandleError(err)
 	}
@@ -135,388 +216,548 @@ func (p *Persister) GetForcedObfuscatedLoginSession(ctx context.Context, client,
 	return &s, nil
 }
 
-func (p *Persister) CreateConsentRequest(ctx context.Context, req *consent.ConsentRequest) error {
-	return errorsx.WithStack(p.Connection(ctx).Create(req))
+func (p *ConsentPersister) CreateConsentSession(ctx context.Context, f *flow.Flow) (err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateConsentSession")
+	defer otelx.End(span, &err)
+
+	if f.NID != p.NetworkID(ctx) {
+		return errors.WithStack(sqlcon.ErrNoRows())
+	}
+	return sqlcon.HandleError(p.Connection(ctx).Create(f))
 }
 
-func (p *Persister) GetConsentRequest(ctx context.Context, challenge string) (*consent.ConsentRequest, error) {
-	r := &consent.ConsentRequest{}
+func (p *Persister) GetRememberedLoginSession(ctx context.Context, id string) (_ *flow.LoginSession, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.GetRememberedLoginSession")
+	defer otelx.End(span, &err)
 
-	if err := r.FindInDB(p.Connection(ctx), challenge); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errorsx.WithStack(x.ErrNotFound)
-		}
+	var s flow.LoginSession
+	if err := p.QueryWithNetwork(ctx).Where("remember = TRUE").Find(&s, id); errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.WithStack(x.ErrNotFound)
+	} else if err != nil {
 		return nil, sqlcon.HandleError(err)
 	}
 
-	return r, nil
+	return &s, nil
 }
 
-func (p *Persister) CreateLoginRequest(ctx context.Context, req *consent.LoginRequest) error {
-	return errorsx.WithStack(p.Connection(ctx).Create(req))
-}
+// ConfirmLoginSession creates or updates the login session. The NID will be set to the network ID of the context.
+func (p *Persister) ConfirmLoginSession(ctx context.Context, loginSession *flow.LoginSession) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.ConfirmLoginSession")
+	defer otelx.End(span, &err)
 
-func (p *Persister) GetLoginRequest(ctx context.Context, challenge string) (*consent.LoginRequest, error) {
-	var lr consent.LoginRequest
-	return &lr, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		if err := (&lr).FindInDB(c, challenge); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return errorsx.WithStack(x.ErrNotFound)
-			}
-			return sqlcon.HandleError(err)
-		}
+	loginSession.NID = p.NetworkID(ctx)
+	loginSession.AuthenticatedAt = sqlxx.NullTime(time.Time(loginSession.AuthenticatedAt).Truncate(time.Second))
+	loginSession.ExpiresAt = sqlxx.NullTime(time.Now().Truncate(time.Second).Add(p.r.Config().GetAuthenticationSessionLifespan(ctx)).UTC())
 
-		return nil
-	})
-}
-
-func (p *Persister) HandleConsentRequest(ctx context.Context, challenge string, r *consent.HandledConsentRequest) (*consent.ConsentRequest, error) {
-	c := p.Connection(ctx)
-
-	if err := sqlcon.HandleError(c.Create(r)); errors.Is(err, sqlcon.ErrUniqueViolation) {
-		hr := &consent.HandledConsentRequest{}
-		if err := c.Find(hr, r.ID); err != nil {
-			return nil, sqlcon.HandleError(err)
-		}
-
-		if hr.WasUsed {
-			return nil, errorsx.WithStack(x.ErrConflict.WithHint("The consent request was already used and can no longer be changed."))
-		}
-
-		if err := c.Update(r); err != nil {
-			return nil, sqlcon.HandleError(err)
-		}
-	} else if err != nil {
-		return nil, err
+	if p.Connection(ctx).Dialect.Name() == "mysql" {
+		// MySQL does not support UPSERT.
+		return p.mySQLConfirmLoginSession(ctx, loginSession)
 	}
 
-	return p.GetConsentRequest(ctx, challenge)
-}
-
-func (p *Persister) VerifyAndInvalidateConsentRequest(ctx context.Context, verifier string) (*consent.HandledConsentRequest, error) {
-	var r consent.HandledConsentRequest
-	return &r, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		var cr consent.ConsentRequest
-		if err := c.Where("verifier = ?", verifier).Select("challenge", "client_id").First(&cr); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		if err := c.Find(&r, cr.ID); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		if r.WasUsed {
-			return errorsx.WithStack(fosite.ErrInvalidRequest.WithDebug("Consent verifier has been used already."))
-		}
-
-		r.WasUsed = true
-		return c.Update(&r)
-	})
-}
-
-func (p *Persister) HandleLoginRequest(ctx context.Context, challenge string, r *consent.HandledLoginRequest) (lr *consent.LoginRequest, err error) {
-	return lr, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		err := c.Create(r)
-		if err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		lr, err = p.GetLoginRequest(ctx, challenge)
+	res, err := p.Connection(ctx).Store.NamedExecContext(ctx, `
+INSERT INTO hydra_oauth2_authentication_session (id, nid, authenticated_at, subject, remember, identity_provider_session_id, expires_at)
+VALUES (:id, :nid, :authenticated_at, :subject, :remember, :identity_provider_session_id, :expires_at)
+ON CONFLICT(id) DO
+UPDATE SET
+	authenticated_at = :authenticated_at,
+	subject = :subject,
+	remember = :remember,
+	identity_provider_session_id = :identity_provider_session_id,
+	expires_at = :expires_at
+WHERE hydra_oauth2_authentication_session.id = :id AND hydra_oauth2_authentication_session.nid = :nid
+`, loginSession)
+	if err != nil {
 		return sqlcon.HandleError(err)
-	})
-}
-
-func (p *Persister) VerifyAndInvalidateLoginRequest(ctx context.Context, verifier string) (*consent.HandledLoginRequest, error) {
-	var d consent.HandledLoginRequest
-	return &d, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		var ar consent.LoginRequest
-		if err := c.Where("verifier = ?", verifier).Select("challenge", "client_id").First(&ar); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		if err := c.Find(&d, ar.ID); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		if d.WasUsed {
-			return errorsx.WithStack(fosite.ErrInvalidRequest.WithDebug("Login verifier has been used already."))
-		}
-
-		d.WasUsed = true
-		return sqlcon.HandleError(c.Update(&d))
-	})
-}
-
-func (p *Persister) GetRememberedLoginSession(ctx context.Context, id string) (*consent.LoginSession, error) {
-	var s consent.LoginSession
-
-	if err := p.Connection(ctx).Where("remember = TRUE").Find(&s, id); errors.Is(err, sql.ErrNoRows) {
-		return nil, errorsx.WithStack(x.ErrNotFound)
-	} else if err != nil {
-		return nil, sqlcon.HandleError(err)
 	}
-
-	return &s, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return sqlcon.HandleError(err)
+	}
+	if n == 0 {
+		return errors.WithStack(x.ErrNotFound)
+	}
+	return nil
 }
 
-func (p *Persister) ConfirmLoginSession(ctx context.Context, id string, authenticatedAt time.Time, subject string, remember bool) error {
-	return sqlcon.HandleError(
-		p.Connection(ctx).Update(&consent.LoginSession{
-			ID:              id,
-			AuthenticatedAt: sqlxx.NullTime(authenticatedAt),
-			Subject:         subject,
-			Remember:        remember,
-		}))
-}
+func (p *Persister) DeleteLoginSession(ctx context.Context, id string) (_ *flow.LoginSession, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.DeleteLoginSession")
+	defer otelx.End(span, &err)
 
-func (p *Persister) CreateLoginSession(ctx context.Context, session *consent.LoginSession) error {
-	return sqlcon.HandleError(p.Connection(ctx).Create(session))
-}
-
-func (p *Persister) DeleteLoginSession(ctx context.Context, id string) error {
-	return sqlcon.HandleError(
-		p.Connection(ctx).Destroy(
-			&consent.LoginSession{ID: id},
-		))
-}
-
-func (p *Persister) FindGrantedAndRememberedConsentRequests(ctx context.Context, client, subject string) ([]consent.HandledConsentRequest, error) {
-	rs := make([]consent.HandledConsentRequest, 0)
-
-	return rs, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		var cr consent.HandledConsentRequest
-		tn := consent.HandledConsentRequest{}.TableName()
-		if err := c.
-			Where(fmt.Sprintf("r.subject = ? AND r.client_id = ? AND r.skip=FALSE AND (%s.error='{}' AND %s.remember=TRUE)", tn, tn), subject, client).
-			Join("hydra_oauth2_consent_request AS r", fmt.Sprintf("%s.challenge = r.challenge", tn)).
-			Order(fmt.Sprintf("%s.requested_at DESC", tn)).
-			Limit(1).
-			First(&cr); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return errorsx.WithStack(consent.ErrNoPreviousConsentFound)
-			}
-			return sqlcon.HandleError(err)
-		}
-
-		var err error
-		rs, err = p.resolveHandledConsentRequests(ctx, []consent.HandledConsentRequest{cr})
-		return err
-	})
-}
-
-func (p *Persister) FindSubjectsGrantedConsentRequests(ctx context.Context, subject string, limit, offset int) ([]consent.HandledConsentRequest, error) {
-	var rs []consent.HandledConsentRequest
 	c := p.Connection(ctx)
-	tn := consent.HandledConsentRequest{}.TableName()
+	if c.Dialect.Name() == "mysql" {
+		// MySQL does not support RETURNING.
+		return p.mySQLDeleteLoginSession(ctx, id)
+	}
 
-	if err := c.
-		Where(fmt.Sprintf("r.subject = ? AND r.skip=FALSE AND %s.error='{}'", tn), subject).
-		Join("hydra_oauth2_consent_request AS r", fmt.Sprintf("%s.challenge = r.challenge", tn)).
-		Order(fmt.Sprintf("%s.requested_at DESC", tn)).
-		Paginate(offset/limit+1, limit).
-		All(&rs); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errorsx.WithStack(consent.ErrNoPreviousConsentFound)
-		}
+	var session flow.LoginSession
+	columns := popx.DBColumns[flow.LoginSession](c.Dialect)
+	if err := p.Connection(ctx).RawQuery(
+		fmt.Sprintf(`DELETE FROM hydra_oauth2_authentication_session WHERE id = ? AND nid = ? RETURNING %s`, columns),
+		id,
+		p.NetworkID(ctx),
+	).First(&session); err != nil {
 		return nil, sqlcon.HandleError(err)
 	}
 
-	return p.resolveHandledConsentRequests(ctx, rs)
+	return &session, nil
 }
 
-func (p *Persister) CountSubjectsGrantedConsentRequests(ctx context.Context, subject string) (int, error) {
-	tn := consent.HandledConsentRequest{}.TableName()
+func (p *Persister) mySQLDeleteLoginSession(ctx context.Context, id string) (_ *flow.LoginSession, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.mySQLDeleteLoginSession")
+	defer otelx.End(span, &err)
 
-	n, err := p.Connection(ctx).
-		Where(fmt.Sprintf("r.subject = ? AND r.skip=FALSE AND %s.error='{}'", tn), subject).
-		Join("hydra_oauth2_consent_request as r", fmt.Sprintf("%s.challenge = r.challenge", tn)).
-		Count(&consent.HandledConsentRequest{})
-	return n, sqlcon.HandleError(err)
-}
-
-func (p *Persister) resolveHandledConsentRequests(ctx context.Context, requests []consent.HandledConsentRequest) ([]consent.HandledConsentRequest, error) {
-	var result []consent.HandledConsentRequest
-
-	for _, v := range requests {
-		_, err := p.GetConsentRequest(ctx, v.ID)
-		if errors.Is(err, sqlcon.ErrNoRows) || errors.Is(err, x.ErrNotFound) {
-			return nil, errorsx.WithStack(consent.ErrNoPreviousConsentFound)
-		} else if err != nil {
-			return nil, err
-		}
-
-		// This will probably never error because we first check if the consent request actually exists
-		if err := v.AfterFind(p.Connection(ctx)); err != nil {
-			return nil, err
-		}
-		if v.RememberFor > 0 && v.RequestedAt.Add(time.Duration(v.RememberFor)*time.Second).Before(time.Now().UTC()) {
-			continue
-		}
-
-		result = append(result, v)
-	}
-
-	if len(result) == 0 {
-		return nil, errorsx.WithStack(consent.ErrNoPreviousConsentFound)
-	}
-
-	return result, nil
-}
-
-func (p *Persister) ListUserAuthenticatedClientsWithFrontChannelLogout(ctx context.Context, subject, sid string) ([]client.Client, error) {
-	return p.listUserAuthenticatedClients(ctx, subject, sid, "front")
-}
-
-func (p *Persister) ListUserAuthenticatedClientsWithBackChannelLogout(ctx context.Context, subject, sid string) ([]client.Client, error) {
-	return p.listUserAuthenticatedClients(ctx, subject, sid, "back")
-}
-
-func (p *Persister) listUserAuthenticatedClients(ctx context.Context, subject, sid, channel string) ([]client.Client, error) {
-	var cs []client.Client
-	return cs, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		if err := c.RawQuery(
-			/* #nosec G201 - channel can either be "front" or "back" */
-			fmt.Sprintf(`SELECT DISTINCT c.* FROM hydra_client as c JOIN hydra_oauth2_consent_request as r ON (c.id = r.client_id) WHERE r.subject=? AND c.%schannel_logout_uri!='' AND c.%schannel_logout_uri IS NOT NULL AND r.login_session_id = ?`,
-				channel,
-				channel,
-			),
-			subject,
-			sid,
-		).All(&cs); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		return nil
-	})
-}
-
-func (p *Persister) CreateLogoutRequest(ctx context.Context, request *consent.LogoutRequest) error {
-	return errorsx.WithStack(p.Connection(ctx).Create(request))
-}
-
-func (p *Persister) AcceptLogoutRequest(ctx context.Context, challenge string) (*consent.LogoutRequest, error) {
-	if err := p.Connection(ctx).RawQuery("UPDATE hydra_oauth2_logout_request SET accepted=true, rejected=false WHERE challenge=?", challenge).Exec(); err != nil {
-		return nil, sqlcon.HandleError(err)
-	}
-
-	return p.GetLogoutRequest(ctx, challenge)
-}
-
-func (p *Persister) RejectLogoutRequest(ctx context.Context, challenge string) error {
-	return errorsx.WithStack(
-		p.Connection(ctx).
-			RawQuery("UPDATE hydra_oauth2_logout_request SET rejected=true, accepted=false WHERE challenge=?", challenge).
-			Exec())
-}
-
-func (p *Persister) GetLogoutRequest(ctx context.Context, challenge string) (*consent.LogoutRequest, error) {
-	var lr consent.LogoutRequest
-	return &lr, sqlcon.HandleError(p.Connection(ctx).Where("challenge = ? AND rejected = FALSE", challenge).First(&lr))
-}
-
-func (p *Persister) VerifyAndInvalidateLogoutRequest(ctx context.Context, verifier string) (*consent.LogoutRequest, error) {
-	var lr consent.LogoutRequest
-	return &lr, p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
-		if err := c.Where("verifier=? AND was_used=FALSE AND accepted=TRUE AND rejected=FALSE", verifier).Select("challenge").First(&lr); err != nil {
-			if err == sql.ErrNoRows {
-				return errorsx.WithStack(x.ErrNotFound)
-			}
-
-			return sqlcon.HandleError(err)
-		}
-
-		if err := c.RawQuery("UPDATE hydra_oauth2_logout_request SET was_used=TRUE WHERE verifier=?", verifier).Exec(); err != nil {
-			return sqlcon.HandleError(err)
-		}
-
-		updated, err := p.GetLogoutRequest(ctx, lr.ID)
-		if err != nil {
+	var session flow.LoginSession
+	if err := p.Connection(ctx).Transaction(func(tx *pop.Connection) error {
+		if err := tx.Where("id = ? AND nid = ?", id, p.NetworkID(ctx)).First(&session); err != nil {
 			return err
 		}
 
-		lr = *updated
+		count, err := tx.RawQuery(
+			`DELETE FROM hydra_oauth2_authentication_session WHERE id = ? AND nid = ?`,
+			id, p.NetworkID(ctx),
+		).ExecWithCount()
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			// A concurrent transaction deleted the session between our
+			// consistent read above and this delete. Surface ErrNoRows so
+			// callers relying on the delete as an at-most-once gate (e.g.
+			// back-channel logout execution) treat this call as the loser,
+			// matching the DELETE ... RETURNING behavior on other dialects.
+			return sql.ErrNoRows
+		}
 		return nil
-	})
+	}); err != nil {
+		return nil, sqlcon.HandleError(err)
+	}
+
+	return &session, nil
 }
 
-func (p *Persister) FlushInactiveLoginConsentRequests(ctx context.Context, notAfter time.Time) error {
-	/* #nosec G201 table is static */
-	var lr consent.LoginRequest
-	var lrh consent.HandledLoginRequest
+func (p *ConsentPersister) FindGrantedAndRememberedConsentRequest(ctx context.Context, client, subject string) (_ *flow.Flow, err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindGrantedAndRememberedConsentRequest")
+	defer otelx.End(span, &err)
 
-	var cr consent.ConsentRequest
-	var crh consent.HandledConsentRequest
+	f := flow.Flow{}
+	conn := p.Connection(ctx)
 
-	return p.transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
+	// apply index hint
+	tableName := applyTableNameWithIndexHint(conn, f.TableName(), "hydra_oauth2_flow_previous_consents_idx")
 
-		// Delete all entries (and their FK)
-		// where hydra_oauth2_authentication_request were timed-out or rejected
-		// - hydra_oauth2_authentication_request_handled
-		// - hydra_oauth2_consent_request_handled
-		// AND
-		// - hydra_oauth2_authentication_request.requested_at < ttl.login_consent_request
-		// - hydra_oauth2_authentication_request.requested_at < notAfter
+	// prepare columns
+	cols := popx.DBColumns[flow.Flow](conn.Dialect)
 
-		// Using NOT EXISTS instead of LEFT JOIN or NOT IN due to
-		// LEFT JOIN not supported by Postgres and NOT IN will have performance hits with large tables.
-		// https://stackoverflow.com/questions/19363481/select-rows-which-are-not-present-in-other-table/19364694#19364694
-		// Cannot use table aliasing in MYSQL, will work in Postgresql though...
+	// prepare sql statement
+	q := fmt.Sprintf(`
+SELECT %s FROM %s
+WHERE nid = ?
+AND (state = ? OR state IS NULL)
+AND subject = ?
+AND client_id = ?
+AND consent_skip = FALSE
+AND consent_remember = TRUE
+AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+ORDER BY requested_at DESC
+LIMIT 1`,
+		cols,
+		tableName,
+	)
 
-		err := p.Connection(ctx).RawQuery(fmt.Sprintf(`
-			DELETE
-			FROM %[1]s
-			WHERE NOT EXISTS
-				(
-				SELECT NULL
-				FROM %[2]s
-				WHERE %[1]s.challenge = %[2]s.challenge AND (%[2]s.error = '{}' OR %[2]s.error = '' OR %[2]s.error is NULL)
-				)
-			AND NOT EXISTS
-				(
-				SELECT NULL
-				FROM %[3]s
-				INNER JOIN %[4]s
-				ON %[3]s.challenge = %[4]s.challenge
-				WHERE %[1]s.challenge = %[3]s.login_challenge AND (%[4]s.error = '{}' OR %[4]s.error = '' OR %[4]s.error is NULL)
-				)
-			AND requested_at < ?
-			AND requested_at < ?
-			`,
-			(&lr).TableName(),
-			(&lrh).TableName(),
-			(&cr).TableName(),
-			(&crh).TableName()),
-			time.Now().Add(-p.config.ConsentRequestMaxAge()),
-			notAfter).Exec()
+	// query first record
+	err = conn.RawQuery(q,
+		p.NetworkID(ctx),
+		flow.FlowStateConsentUsed,
+		subject,
+		client,
+	).First(&f)
 
-		if err != nil {
+	// handle error
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.WithStack(consent.ErrNoPreviousConsentFound)
+	} else if err != nil {
+		return nil, sqlcon.HandleError(err)
+	}
+
+	return &f, nil
+}
+
+func applyTableNameWithIndexHint(conn *pop.Connection, table string, index string) string {
+	switch conn.Dialect.Name() {
+	case "cockroach":
+		return table + "@" + index
+	case "sqlite3":
+		return table + " INDEXED BY " + index
+	case "mysql":
+		return table + " USE INDEX(" + index + ")"
+	default:
+		// PostgreSQL and YugabyteDB do not accept these dialect-specific index
+		// hint syntaxes.
+		return table
+	}
+}
+
+func (p *ConsentPersister) FindSubjectsGrantedConsentRequests(ctx context.Context, subject string, pageOpts ...keysetpagination.Option) (_ []flow.Flow, _ *keysetpagination.Paginator, err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindSubjectsGrantedConsentRequests")
+	defer otelx.End(span, &err)
+
+	paginator, err := keysetpagination.NewPaginator(append(pageOpts,
+		keysetpagination.WithDefaultToken(keysetpagination.NewPageToken(keysetpagination.Column{Name: "login_challenge", Value: ""})),
+	)...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var fs []flow.Flow
+	err = p.QueryWithNetwork(ctx).
+		Where("(state IN (?, ?) OR state IS NULL)", flow.FlowStateConsentUsed, flow.FlowStateConsentUnused).
+		Where("subject = ?", subject).
+		Where("consent_skip = FALSE").
+		Where("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)").
+		Scope(keysetpagination.Paginate[flow.Flow](paginator)).
+		All(&fs)
+	if err != nil {
+		return nil, nil, sqlcon.HandleError(err)
+	}
+	if len(fs) == 0 {
+		return nil, nil, errors.WithStack(consent.ErrNoPreviousConsentFound)
+	}
+
+	fs, nextPage := keysetpagination.Result(fs, paginator)
+	return fs, nextPage, nil
+}
+
+func (p *ConsentPersister) FindSubjectsSessionGrantedConsentRequests(ctx context.Context, subject, sid string, pageOpts ...keysetpagination.Option) (_ []flow.Flow, _ *keysetpagination.Paginator, err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindSubjectsSessionGrantedConsentRequests", trace.WithAttributes(attribute.String("sid", sid)))
+	defer otelx.End(span, &err)
+
+	paginator, err := keysetpagination.NewPaginator(append(pageOpts,
+		keysetpagination.WithDefaultToken(keysetpagination.NewPageToken(keysetpagination.Column{Name: "login_challenge", Value: ""})),
+	)...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var fs []flow.Flow
+	err = p.QueryWithNetwork(ctx).
+		Where("(state IN (?, ?) OR state IS NULL)", flow.FlowStateConsentUsed, flow.FlowStateConsentUnused).
+		Where("subject = ?", subject).
+		Where("login_session_id = ?", sid).
+		Where("consent_skip = FALSE").
+		Where("(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)").
+		Scope(keysetpagination.Paginate[flow.Flow](paginator)).
+		All(&fs)
+	if err != nil {
+		return nil, nil, sqlcon.HandleError(err)
+	}
+	if len(fs) == 0 {
+		return nil, nil, errors.WithStack(consent.ErrNoPreviousConsentFound)
+	}
+
+	fs, nextPage := keysetpagination.Result(fs, paginator)
+	return fs, nextPage, nil
+}
+
+func (p *ConsentPersister) ListClientsWithLogoutURLsForSubjectAndSID(ctx context.Context, subject, sid string) (withFrontChannelURL, withBackChannelURL []client.Client, err error) {
+	ctx, span := p.d.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.ListClientsWithLogoutURLsForSubjectAndSID",
+		trace.WithAttributes(attribute.String("sid", sid)))
+	defer otelx.End(span, &err)
+
+	defer func() {
+		span.SetAttributes(
+			attribute.Int("withFrontChannelURL", len(withFrontChannelURL)),
+			attribute.Int("withBackChannelURL", len(withBackChannelURL)))
+	}()
+
+	var (
+		cols                   = pop.NewModel(new(client.Client), ctx).Columns().Readable()
+		clientTable, flowTable = clientFlowTableNamesWithQueryHint(p.Connection(ctx).Dialect.Name())
+
+		q = fmt.Sprintf(`
+		SELECT %s FROM %s c
+		WHERE id IN (
+			SELECT client_id
+			FROM %s f
+			WHERE
+				f.nid = ?
+				AND f.login_session_id = ?
+				AND f.subject = ?
+		)
+		AND	c.nid = ?
+		AND (
+			c.frontchannel_logout_uri != '' OR c.backchannel_logout_uri != ''
+		)`,
+			cols.QuotedString(p.Connection(ctx).Dialect),
+			clientTable,
+			flowTable)
+
+		nid = p.NetworkID(ctx)
+		cs  []client.Client
+	)
+
+	err = p.Connection(ctx).RawQuery(q, nid, sid, subject, nid).All(&cs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, sqlcon.HandleError(err)
+	}
+
+	for _, c := range cs {
+		if c.FrontChannelLogoutURI != "" {
+			withFrontChannelURL = append(withFrontChannelURL, c)
+		}
+		if c.BackChannelLogoutURI != "" {
+			withBackChannelURL = append(withBackChannelURL, c)
+		}
+	}
+
+	return withFrontChannelURL, withBackChannelURL, nil
+}
+
+func clientFlowTableNamesWithQueryHint(dialect string) (clientTable, flowTable string) {
+	switch dialect {
+	case "cockroach":
+		return "hydra_client@primary", "hydra_oauth2_flow@hydra_oauth2_flow_login_session_subject_idx"
+	default:
+		// PostgreSQL and YugabyteDB do not accept CockroachDB's @index syntax.
+		return "hydra_client", "hydra_oauth2_flow"
+	}
+}
+
+// logoutPayload is the wire format used when AEAD-encoding logout challenges
+// and verifiers. It carries internal fields that must not appear in the public
+// oAuth2LogoutRequest HTTP response (PostLogoutRedirectURI) and the network ID
+// used to enforce tenant isolation across the encrypted blob.
+type logoutPayload struct {
+	*flow.LogoutRequest
+	PostLogoutRedirectURI string    `json:"redir_url,omitempty"`
+	NID                   uuid.UUID `json:"nid"`
+}
+
+func newLogoutPayload(req *flow.LogoutRequest, nid uuid.UUID) *logoutPayload {
+	return &logoutPayload{
+		LogoutRequest:         req,
+		PostLogoutRedirectURI: req.PostLogoutRedirectURI,
+		NID:                   nid,
+	}
+}
+
+// ToLogoutRequest validates the payload's NID against currentNID and returns
+// the embedded LogoutRequest with PostLogoutRedirectURI restored. Returns
+// x.ErrNotFound if the NID does not match, mirroring how flow.decodeFlow
+// rejects cross-tenant challenges for login, consent, and device flows, and
+// ErrorLogoutFlowExpired if the embedded expiry has passed. Stateless blobs
+// cannot be revoked, so the expiry is their only time bound and every decode
+// path must enforce it.
+func (payload *logoutPayload) ToLogoutRequest(currentNID uuid.UUID) (*flow.LogoutRequest, error) {
+	if payload.NID != currentNID {
+		return nil, errors.WithStack(x.ErrNotFound.WithDescription("Network IDs are not matching."))
+	}
+	if payload.LogoutRequest == nil {
+		payload.LogoutRequest = &flow.LogoutRequest{}
+	}
+	if payload.ExpiresAt == nil || payload.ExpiresAt.Before(time.Now()) {
+		return nil, errors.WithStack(flow.ErrorLogoutFlowExpired)
+	}
+	payload.LogoutRequest.PostLogoutRedirectURI = payload.PostLogoutRedirectURI
+	return payload.LogoutRequest, nil
+}
+
+// looksLikeLegacyUUID reports whether s parses as a UUID. Before the
+// stateless logout flow shipped, logout challenges and verifiers were
+// generated via uuid.New() and stored in the hydra_oauth2_logout_request
+// table. During the rollout window — until any such legacy
+// challenge/verifier has aged past the configured logout request TTL — we
+// surface UUID-shaped inputs as "expired" so clients retry through their
+// normal logout-flow restart path, rather than as a generic decryption
+// failure.
+func looksLikeLegacyUUID(s string) bool {
+	_, err := uuid.FromString(s)
+	return err == nil
+}
+
+func (p *Persister) CreateLogoutChallenge(ctx context.Context, request *flow.LogoutRequest) (challenge string, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateLogoutChallenge")
+	defer otelx.End(span, &err)
+
+	// The challenge IS the AEAD blob we're about to produce, so encoding it
+	// into the payload would be self-referential and bloat the size. Blank it
+	// before encoding; GetLogoutRequest will populate it again on decode.
+	request.Challenge = ""
+	challenge, err = flow.Encode(ctx, p.r.FlowCipher(), newLogoutPayload(request, p.NetworkID(ctx)), flow.AsLogoutChallenge)
+	if err != nil {
+		return "", errors.WithStack(fosite.ErrServerError.WithWrap(err).WithHintf("Failed to encrypt the logout challenge."))
+	}
+	return challenge, nil
+}
+
+func (p *Persister) AcceptLogoutRequest(ctx context.Context, challenge string) (verifier string, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.AcceptLogoutRequest")
+	defer otelx.End(span, &err)
+
+	payload, err := flow.Decode[logoutPayload](ctx, p.r.FlowCipher(), challenge, flow.AsLogoutChallenge)
+	if err != nil {
+		if looksLikeLegacyUUID(challenge) {
+			return "", errors.WithStack(flow.ErrorLogoutFlowExpired)
+		}
+		return "", errors.WithStack(x.ErrNotFound.WithWrap(err).WithHintf("Failed to decrypt the logout challenge."))
+	}
+	nid := p.NetworkID(ctx)
+	req, err := payload.ToLogoutRequest(nid)
+	if err != nil {
+		return "", err
+	}
+	// The verifier IS the AEAD blob we're about to produce. Avoid embedding the
+	// caller-provided challenge inside the verifier payload (self-referential
+	// and bloats size).
+	req.Challenge = ""
+	// The verifier is consumed machine-to-machine by the logout completion
+	// handler, which only needs the subject, session ID, RP flag, expiry, and
+	// post-logout redirect URI. Drop the client metadata and the original
+	// request URL (which can embed a full id_token_hint JWT) to keep the
+	// verifier — and thus the redirect URL it travels in — short.
+	req.Client = nil
+	req.RequestURL = ""
+
+	verifier, err = flow.Encode(ctx, p.r.FlowCipher(), newLogoutPayload(req, nid), flow.AsLogoutVerifier)
+	if err != nil {
+		return "", errors.WithStack(fosite.ErrServerError.WithWrap(err).WithHintf("Failed to encrypt the logout verifier."))
+	}
+
+	return verifier, nil
+}
+
+func (p *Persister) RejectLogoutRequest(ctx context.Context, challenge string) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.RejectLogoutRequest")
+	defer otelx.End(span, &err)
+
+	payload, err := flow.Decode[logoutPayload](ctx, p.r.FlowCipher(), challenge, flow.AsLogoutChallenge)
+	if err != nil {
+		if looksLikeLegacyUUID(challenge) {
+			return errors.WithStack(flow.ErrorLogoutFlowExpired)
+		}
+		return errors.WithStack(x.ErrNotFound.WithWrap(err).WithHintf("Failed to decrypt the logout challenge."))
+	}
+	if _, err := payload.ToLogoutRequest(p.NetworkID(ctx)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *Persister) GetLogoutRequest(ctx context.Context, challenge string) (_ *flow.LogoutRequest, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.GetLogoutRequest")
+	defer otelx.End(span, &err)
+
+	payload, err := flow.Decode[logoutPayload](ctx, p.r.FlowCipher(), challenge, flow.AsLogoutChallenge)
+	if err != nil {
+		if looksLikeLegacyUUID(challenge) {
+			return nil, errors.WithStack(flow.ErrorLogoutFlowExpired)
+		}
+		return nil, errors.WithStack(x.ErrNotFound.WithWrap(err).WithHintf("Failed to decrypt the logout challenge."))
+	}
+	req, err := payload.ToLogoutRequest(p.NetworkID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	req.Challenge = challenge
+	return req, nil
+}
+
+func (p *Persister) VerifyAndInvalidateLogoutRequest(ctx context.Context, verifier string) (_ *flow.LogoutRequest, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.VerifyAndInvalidateLogoutRequest")
+	defer otelx.End(span, &err)
+
+	payload, err := flow.Decode[logoutPayload](ctx, p.r.FlowCipher(), verifier, flow.AsLogoutVerifier)
+	if err != nil {
+		if looksLikeLegacyUUID(verifier) {
+			return nil, errors.WithStack(flow.ErrorLogoutFlowExpired)
+		}
+		return nil, errors.WithStack(x.ErrNotFound.WithWrap(err).WithHintf("Failed to decrypt the logout verifier."))
+	}
+	lr, err := payload.ToLogoutRequest(p.NetworkID(ctx))
+	if err != nil {
+		return nil, err
+	}
+
+	return lr, nil
+}
+
+func (p *Persister) FlushInactiveLoginConsentRequests(ctx context.Context, notAfter time.Time, limit, batchSize int) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FlushInactiveLoginConsentRequests")
+	defer otelx.End(span, &err)
+
+	// The value of notAfter should be the minimum between input parameter and request max expire based on its configured age
+	requestMaxExpire := time.Now().Add(-p.r.Config().ConsentRequestMaxAge(ctx))
+	if requestMaxExpire.Before(notAfter) {
+		notAfter = requestMaxExpire
+	}
+
+	challenges := make([]string, 0, limit)
+	// Select up to [limit] flows that can be safely deleted, i.e. flows that meet
+	// the following criteria:
+	// - flow.state is anything between FlowStateLoginInitialized and FlowStateConsentUnused (unhandled)
+	// - flow.login_error has valid error (login rejected)
+	// - flow.consent_error has valid error (consent rejected)
+	// AND timed-out
+	// - flow.requested_at < minimum of ttl.login_consent_request and notAfter
+	q := p.Connection(ctx).RawQuery(`
+		SELECT login_challenge
+		FROM hydra_oauth2_flow
+		WHERE (
+			(state != ? AND state IS NOT NULL)
+			OR (login_error IS NOT NULL AND login_error <> '{}' AND login_error <> '')
+			OR (consent_error IS NOT NULL AND consent_error <> '{}' AND consent_error <> '')
+		)
+		AND requested_at < ?
+		AND nid = ?
+		ORDER BY login_challenge
+		LIMIT ?`,
+		flow.FlowStateConsentUsed, notAfter, p.NetworkID(ctx), limit)
+
+	if err := q.All(&challenges); err != nil {
+		return errors.WithStack(err)
+	}
+
+	// Delete in batch consent requests and their references in cascade
+	for i := 0; i < len(challenges); i += batchSize {
+		j := min(i+batchSize, len(challenges))
+
+		q := p.Connection(ctx).RawQuery(
+			"DELETE FROM hydra_oauth2_flow WHERE login_challenge in (?) AND nid = ?",
+			challenges[i:j],
+			p.NetworkID(ctx),
+		)
+
+		if err := q.Exec(); err != nil {
 			return sqlcon.HandleError(err)
 		}
+	}
 
-		// This query is needed due to the fact that the first query will not delete cascade to the consent tables
-		// This cleans up the consent requests if requests have timed out or been rejected.
+	return nil
+}
 
-		// Using NOT EXISTS instead of LEFT JOIN or NOT IN due to
-		// LEFT JOIN not supported by Postgres and NOT IN will have performance hits with large tables.
-		// https://stackoverflow.com/questions/19363481/select-rows-which-are-not-present-in-other-table/19364694#19364694
-		// Cannot use table aliasing in MYSQL, will work in Postgresql though...
-		err = p.Connection(ctx).RawQuery(
-			fmt.Sprintf(`
-			DELETE
-			FROM %[1]s
-			WHERE NOT EXISTS
-				(
-				SELECT NULL
-				FROM %[2]s
-				WHERE %[1]s.challenge = %[2]s.challenge AND (%[2]s.error = '{}' OR %[2]s.error = '' OR %[2]s.error is NULL)
-				)
-			AND requested_at < ?
-			AND requested_at < ?`,
-				(&cr).TableName(),
-				(&crh).TableName()),
-			time.Now().Add(-p.config.ConsentRequestMaxAge()),
-			notAfter).Exec()
+func (p *Persister) mySQLConfirmLoginSession(ctx context.Context, session *flow.LoginSession) error {
+	return p.Transaction(ctx, func(ctx context.Context, c *pop.Connection) error {
+		err := sqlcon.HandleError(c.Create(session))
+		if err == nil {
+			return nil
+		}
 
-		return sqlcon.HandleError(err)
+		if !errors.Is(err, sqlcon.ErrUniqueViolation()) {
+			return err
+		}
+
+		n, err := c.
+			Where("id = ? and nid = ?", session.ID, session.NID).
+			UpdateQuery(session, "authenticated_at", "subject", "identity_provider_session_id", "remember", "expires_at")
+		if err != nil {
+			return errors.WithStack(sqlcon.HandleError(err))
+		}
+		if n == 0 {
+			return errors.WithStack(x.ErrNotFound)
+		}
+
+		return nil
 	})
 }

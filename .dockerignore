@@ -1,9 +1,9 @@
+.git
 .idea
 .vagrant
 docs
 node_modules
 .circleci
-.docker-home
 .github
 scripts
 sdk/js
@@ -13,5 +13,4 @@ dist
 .bin
 test/e2e
 test/mock-*
-test/stub
 cypress

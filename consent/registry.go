@@ -1,28 +1,40 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package consent
 
 import (
-	"github.com/ory/fosite"
-	"github.com/ory/fosite/handler/openid"
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/x"
+	"github.com/ory/hydra/v2/aead"
+	"github.com/ory/hydra/v2/client"
+	"github.com/ory/hydra/v2/fosite/handler/openid"
+	"github.com/ory/hydra/v2/internal/kratos"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
 )
 
 type InternalRegistry interface {
-	x.RegistryWriter
+	httpx.WriterProvider
 	x.RegistryCookieStore
-	x.RegistryLogger
+	logrusx.Provider
+	httpx.ClientProvider
+	otelx.Provider
+	x.NetworkProvider
+	kratos.Provider
 	Registry
 	client.Registry
 
+	FlowCipher() *aead.XChaCha20Poly1305
 	OAuth2Storage() x.FositeStorer
-	OpenIDJWTStrategy() jwk.JWTStrategy
 	OpenIDConnectRequestValidator() *openid.OpenIDConnectRequestValidator
-	ScopeStrategy() fosite.ScopeStrategy
 }
 
 type Registry interface {
-	ConsentManager() Manager
+	ManagerProvider
+	ObfuscatedSubjectManagerProvider
+	LoginManagerProvider
+	LogoutManagerProvider
+
 	ConsentStrategy() Strategy
-	SubjectIdentifierAlgorithm() map[string]SubjectIdentifierAlgorithm
 }

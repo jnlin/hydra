@@ -1,3 +1,6 @@
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package cli
 
 import (
@@ -5,7 +8,7 @@ import (
 	"encoding/json"
 )
 
-func formatSwaggerError(err error) string {
+func FormatSwaggerError(err error) string {
 	if err == nil {
 		return ""
 	}

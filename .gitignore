@@ -1,4 +1,6 @@
+.bin/
 .idea/
+.vscode/
 node_modules/
 *.iml
 *.exe
@@ -23,6 +25,11 @@ LICENSE.txt
 hydra-login-consent-node
 ./cypress/screenshots
 *-packr.go
+consent/csrf_flagka.go
 packrd/
 persistence/sql/migrations/schema.sql
 cypress/videos
+cypress/screenshots
+BENCHMARKS.md
+*.sqlite
+hydra

@@ -1,22 +1,5 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package x
 
@@ -53,9 +36,9 @@ func TestLogError(t *testing.T) {
 	l.Logger.Out = buf
 	LogError(r, errors.New("asdf"), l)
 
-	t.Logf("%s", string(buf.Bytes()))
+	t.Logf("%s", buf.String())
 
-	assert.True(t, strings.Contains(string(buf.Bytes()), "trace"))
+	assert.True(t, strings.Contains(buf.String(), "trace"))
 
 	LogError(r, errors.Wrap(new(errStackTracer), ""), l)
 }

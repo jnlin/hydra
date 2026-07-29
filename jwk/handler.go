@@ -1,41 +1,22 @@
-/*
- * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
- * @license 	Apache-2.0
- */
+// Copyright © 2022 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
 
 package jwk
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"net/url"
+	"sync/atomic"
 
-	"github.com/ory/hydra/driver/config"
-
-	"github.com/ory/x/errorsx"
-
-	"github.com/ory/x/stringslice"
-
-	"github.com/ory/hydra/x"
-
-	"github.com/julienschmidt/httprouter"
+	"github.com/go-jose/go-jose/v3"
 	"github.com/pkg/errors"
-	jose "gopkg.in/square/go-jose.v2"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/ory/herodot"
+	"github.com/ory/hydra/v2/x"
+	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/urlx"
 )
 
 const (
@@ -45,219 +26,333 @@ const (
 
 type Handler struct {
 	r InternalRegistry
-	c *config.Provider
 }
 
-func NewHandler(r InternalRegistry, c *config.Provider) *Handler {
-	return &Handler{r: r, c: c}
-}
-
-func (h *Handler) SetRoutes(admin *x.RouterAdmin, public *x.RouterPublic, corsMiddleware func(http.Handler) http.Handler) {
-	public.Handler("OPTIONS", WellKnownKeysPath, corsMiddleware(http.HandlerFunc(h.handleOptions)))
-	public.Handler("GET", WellKnownKeysPath, corsMiddleware(http.HandlerFunc(h.WellKnown)))
-
-	admin.GET(KeyHandlerPath+"/:set/:key", h.GetKey)
-	admin.GET(KeyHandlerPath+"/:set", h.GetKeySet)
-
-	admin.POST(KeyHandlerPath+"/:set", h.Create)
-
-	admin.PUT(KeyHandlerPath+"/:set/:key", h.UpdateKey)
-	admin.PUT(KeyHandlerPath+"/:set", h.UpdateKeySet)
-
-	admin.DELETE(KeyHandlerPath+"/:set/:key", h.DeleteKey)
-	admin.DELETE(KeyHandlerPath+"/:set", h.DeleteKeySet)
-}
-
-// swagger:route GET /.well-known/jwks.json public wellKnown
+// JSON Web Key Set
 //
-// JSON Web Keys Discovery
+// swagger:model jsonWebKeySet
 //
-// This endpoint returns JSON Web Keys to be used as public keys for verifying OpenID Connect ID Tokens and,
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type jsonWebKeySet struct {
+	// List of JSON Web Keys
+	//
+	// The value of the "keys" parameter is an array of JSON Web Key (JWK)
+	// values. By default, the order of the JWK values within the array does
+	// not imply an order of preference among them, although applications
+	// of JWK Sets can choose to assign a meaning to the order for their
+	// purposes, if desired.
+	Keys []x.JSONWebKey `json:"keys"`
+}
+
+func NewHandler(r InternalRegistry) *Handler {
+	return &Handler{r: r}
+}
+
+func (h *Handler) SetPublicRoutes(r *httprouterx.RouterPublic, corsMiddleware func(http.Handler) http.Handler) {
+	r.OPTIONS(WellKnownKeysPath, corsMiddleware(http.HandlerFunc(h.handleOptions)).ServeHTTP)
+	r.GET(WellKnownKeysPath, corsMiddleware(http.HandlerFunc(h.discoverJsonWebKeys)).ServeHTTP)
+}
+
+func (h *Handler) SetAdminRoutes(r *httprouterx.RouterAdmin) {
+	r.GET(KeyHandlerPath+"/{set}/{kid}", h.getJsonWebKey)
+	r.GET(KeyHandlerPath+"/{set}", h.getJsonWebKeySet)
+
+	r.POST(KeyHandlerPath+"/{set}", h.createJsonWebKeySet)
+
+	r.PUT(KeyHandlerPath+"/{set}/{kid}", h.adminUpdateJsonWebKey)
+	r.PUT(KeyHandlerPath+"/{set}", h.setJsonWebKeySet)
+
+	r.DELETE(KeyHandlerPath+"/{set}/{kid}", h.deleteJsonWebKey)
+	r.DELETE(KeyHandlerPath+"/{set}", h.adminDeleteJsonWebKeySet)
+}
+
+// swagger:route GET /.well-known/jwks.json wellknown discoverJsonWebKeys
+//
+// # Discover Well-Known JSON Web Keys
+//
+// This endpoint returns JSON Web Keys required to verifying OpenID Connect ID Tokens and,
 // if enabled, OAuth 2.0 JWT Access Tokens. This endpoint can be used with client libraries like
 // [node-jwks-rsa](https://github.com/auth0/node-jwks-rsa) among others.
 //
-//     Consumes:
-//     - application/json
+// Adding custom keys requires first creating a keyset via the createJsonWebKeySet operation,
+// and then configuring the webfinger.jwks.broadcast_keys configuration value to include the keyset name.
 //
-//     Produces:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Schemes: http, https
+//	Produces:
+//	- application/json
 //
-//     Responses:
-//       200: JSONWebKeySet
-//       500: genericError
-func (h *Handler) WellKnown(w http.ResponseWriter, r *http.Request) {
-	var jwks jose.JSONWebKeySet
+//	Schemes: http, https
+//
+//	Responses:
+//	  200: jsonWebKeySet
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-public-high
+func (h *Handler) discoverJsonWebKeys(w http.ResponseWriter, r *http.Request) {
+	eg, ctx := errgroup.WithContext(r.Context())
+	wellKnownKeys := h.r.Config().WellKnownKeys(ctx)
 
-	for _, set := range stringslice.Unique(h.c.WellKnownKeys()) {
-		keys, err := h.r.KeyManager().GetKeySet(r.Context(), set)
-		if err != nil {
-			h.r.Writer().WriteError(w, r, err)
-			return
-		}
+	keys := make([]*jose.JSONWebKeySet, len(wellKnownKeys))
+	nTotalKeys := atomic.Int64{}
+	for i, set := range wellKnownKeys {
+		eg.Go(func() error {
+			k, err := h.r.KeyManager().GetKeySet(ctx, set)
+			if errors.Is(err, x.ErrNotFound) {
+				k, err = getOrGenerateKeySet(ctx, h.r, set, "", string(jose.RS256), "sig")
+			}
+			if err != nil {
+				return err
+			}
+			keys[i] = ExcludePrivateKeys(k)
+			nTotalKeys.Add(int64(len(keys[i].Keys)))
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		h.r.Writer().WriteError(w, r, err)
+		return
+	}
 
-		keys, err = FindKeysByPrefix(keys, "public")
-		if err != nil {
-			h.r.Writer().WriteError(w, r, err)
-			return
-		}
-
-		jwks.Keys = append(jwks.Keys, keys.Keys...)
+	jwks := jose.JSONWebKeySet{Keys: make([]jose.JSONWebKey, 0, nTotalKeys.Load())}
+	for _, k := range keys {
+		jwks.Keys = append(jwks.Keys, k.Keys...)
 	}
 
 	h.r.Writer().Write(w, r, &jwks)
 }
 
-// swagger:route GET /keys/{set}/{kid} admin getJsonWebKey
+// Get JSON Web Key Request
 //
-// Fetch a JSON Web Key
+// swagger:parameters getJsonWebKey
+type _ struct {
+	// JSON Web Key Set ID
+	//
+	// in: path
+	// required: true
+	Set string `json:"set"`
+
+	// JSON Web Key ID
+	//
+	// in: path
+	// required: true
+	KID string `json:"kid"`
+}
+
+// swagger:route GET /admin/keys/{set}/{kid} jwk getJsonWebKey
 //
-// This endpoint returns a singular JSON Web Key, identified by the set and the specific key ID (kid).
+// # Get JSON Web Key
 //
-//     Consumes:
-//     - application/json
+// This endpoint returns a singular JSON Web Key contained in a set. It is identified by the set and the specific key ID (kid).
 //
-//     Produces:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Schemes: http, https
+//	Produces:
+//	- application/json
 //
-//     Responses:
-//       200: JSONWebKeySet
-//       404: genericError
-//       500: genericError
-func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	var setName = ps.ByName("set")
-	var keyName = ps.ByName("key")
+//	Schemes: http, https
+//
+//	Responses:
+//	  200: jsonWebKeySet
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-medium
+func (h *Handler) getJsonWebKey(w http.ResponseWriter, r *http.Request) {
+	setName := r.PathValue("set")
+	keyName := r.PathValue("kid")
 
 	keys, err := h.r.KeyManager().GetKey(r.Context(), setName, keyName)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
+	keys = ExcludeOpaquePrivateKeys(keys)
 
 	h.r.Writer().Write(w, r, keys)
 }
 
-// swagger:route GET /keys/{set} admin getJsonWebKeySet
+// Get JSON Web Key Set Parameters
 //
-// Retrieve a JSON Web Key Set
+// swagger:parameters getJsonWebKeySet
+type _ struct {
+	// JSON Web Key Set ID
+	//
+	// in: path
+	// required: true
+	Set string `json:"set"`
+}
+
+// swagger:route GET /admin/keys/{set} jwk getJsonWebKeySet
+//
+// # Retrieve a JSON Web Key Set
 //
 // This endpoint can be used to retrieve JWK Sets stored in ORY Hydra.
 //
 // A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: JSONWebKeySet
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) GetKeySet(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	var setName = ps.ByName("set")
+//	Responses:
+//	  200: jsonWebKeySet
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-medium
+func (h *Handler) getJsonWebKeySet(w http.ResponseWriter, r *http.Request) {
+	setName := r.PathValue("set")
 
 	keys, err := h.r.KeyManager().GetKeySet(r.Context(), setName)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
+	keys = ExcludeOpaquePrivateKeys(keys)
 
 	h.r.Writer().Write(w, r, keys)
 }
 
-// swagger:route POST /keys/{set} admin createJsonWebKeySet
+// Create JSON Web Key Set Request
 //
-// Generate a New JSON Web Key
+// swagger:parameters createJsonWebKeySet
+type _ struct {
+	// The JSON Web Key Set ID
+	//
+	// in: path
+	// required: true
+	Set string `json:"set"`
+
+	// in: body
+	// required: true
+	Body createJsonWebKeySetBody
+}
+
+// Create JSON Web Key Set Request Body
 //
-// This endpoint is capable of generating JSON Web Key Sets for you. There a different strategies available, such as symmetric cryptographic keys (HS256, HS512) and asymetric cryptographic keys (RS256, ECDSA). If the specified JSON Web Key Set does not exist, it will be created.
+// swagger:model createJsonWebKeySet
+type createJsonWebKeySetBody struct {
+	// JSON Web Key Algorithm
+	//
+	// The algorithm to be used for creating the key. Supports `RS256`, `ES256`, `ES512`, `HS512`, and `HS256`.
+	//
+	// required: true
+	Algorithm string `json:"alg"`
+
+	// JSON Web Key Use
+	//
+	// The "use" (public key use) parameter identifies the intended use of
+	// the public key. The "use" parameter is employed to indicate whether
+	// a public key is used for encrypting data or verifying the signature
+	// on data. Valid values are "enc" and "sig".
+	// required: true
+	Use string `json:"use"`
+
+	// JSON Web Key ID
+	//
+	// The Key ID of the key to be created.
+	//
+	// required: true
+	KeyID string `json:"kid"`
+}
+
+// swagger:route POST /admin/keys/{set} jwk createJsonWebKeySet
+//
+// # Create JSON Web Key
+//
+// This endpoint is capable of generating JSON Web Key Sets for you. There are different strategies available, such as symmetric cryptographic keys (HS256, HS512) and asymmetric cryptographic keys (RS256, ECDSA). If the specified JSON Web Key Set does not exist, it will be created.
+//
+// If the set already exists, the newly generated key is added to it and all existing keys are kept. This allows you to rotate keys: tokens signed with an older key in the set remain verifiable. Exception: when Ory Hydra is configured to use a Hardware Security Module (HSM), generating a key replaces the set, which then contains only the new key. To replace a set and all of its keys instead, use the `setJsonWebKeySet` operation (`PUT /admin/keys/{set}`).
 //
 // A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       201: JSONWebKeySet
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) Create(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	var keyRequest createRequest
-	var set = ps.ByName("set")
+//	Responses:
+//	  201: jsonWebKeySet
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-low
+func (h *Handler) createJsonWebKeySet(w http.ResponseWriter, r *http.Request) {
+	var keyRequest createJsonWebKeySetBody
+	set := r.PathValue("set")
 
 	if err := json.NewDecoder(r.Body).Decode(&keyRequest); err != nil {
-		h.r.Writer().WriteError(w, r, errorsx.WithStack(err))
-	}
-
-	generator, found := h.r.KeyGenerators()[keyRequest.Algorithm]
-	if !found {
-		h.r.Writer().WriteErrorCode(w, r, http.StatusBadRequest, errors.Errorf("Generator %s unknown", keyRequest.Algorithm))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Unable to decode the request body: %s", err)))
 		return
 	}
 
-	keys, err := generator.Generate(keyRequest.KeyID, keyRequest.Use)
-	if err != nil {
+	if keys, err := h.r.KeyManager().GenerateAndPersistKeySet(r.Context(), set, keyRequest.KeyID, keyRequest.Algorithm, keyRequest.Use); err == nil {
+		keys = ExcludeOpaquePrivateKeys(keys)
+		h.r.Writer().WriteCreated(w, r, urlx.AppendPaths(h.r.Config().IssuerURL(r.Context()), "keys", url.PathEscape(set)).String(), keys)
+	} else {
 		h.r.Writer().WriteError(w, r, err)
-		return
 	}
-
-	if err := h.r.KeyManager().AddKeySet(r.Context(), set, keys); err != nil {
-		h.r.Writer().WriteError(w, r, err)
-		return
-	}
-
-	h.r.Writer().WriteCreated(w, r, fmt.Sprintf("%s://%s/keys/%s", r.URL.Scheme, r.URL.Host, set), keys)
 }
 
-// swagger:route PUT /keys/{set} admin updateJsonWebKeySet
+// Set JSON Web Key Set Request
 //
-// Update a JSON Web Key Set
+// swagger:parameters setJsonWebKeySet
+type _ struct {
+	// The JSON Web Key Set ID
+	//
+	// in: path
+	// required: true
+	Set string `json:"set"`
+
+	// in: body
+	Body jsonWebKeySet
+}
+
+// swagger:route PUT /admin/keys/{set} jwk setJsonWebKeySet
+//
+// # Update a JSON Web Key Set
 //
 // Use this method if you do not want to let Hydra generate the JWKs for you, but instead save your own.
 //
+// This operation replaces the entire JSON Web Key Set: keys that exist in the set but are not part of the request body are deleted. To add a newly generated key to the set while keeping the existing keys, use the `createJsonWebKeySet` operation (`POST /admin/keys/{set}`).
+//
 // A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: JSONWebKeySet
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) UpdateKeySet(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//	Responses:
+//	  200: jsonWebKeySet
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-low
+func (h *Handler) setJsonWebKeySet(w http.ResponseWriter, r *http.Request) {
 	var keySet jose.JSONWebKeySet
-	var set = ps.ByName("set")
+	set := r.PathValue("set")
 
 	if err := json.NewDecoder(r.Body).Decode(&keySet); err != nil {
-		h.r.Writer().WriteError(w, r, errorsx.WithStack(err))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Unable to decode the request body: %s", err)))
 		return
 	}
 
-	if err := h.r.KeyManager().DeleteKeySet(r.Context(), set); err != nil {
-		h.r.Writer().WriteError(w, r, err)
-		return
-	}
-
-	if err := h.r.KeyManager().AddKeySet(r.Context(), set, &keySet); err != nil {
+	if err := h.r.KeyManager().UpdateKeySet(r.Context(), set, &keySet); err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
@@ -265,42 +360,63 @@ func (h *Handler) UpdateKeySet(w http.ResponseWriter, r *http.Request, ps httpro
 	h.r.Writer().Write(w, r, &keySet)
 }
 
-// swagger:route PUT /keys/{set}/{kid} admin updateJsonWebKey
+// Set JSON Web Key Request
 //
-// Update a JSON Web Key
+// swagger:parameters setJsonWebKey
+type _ struct {
+	// The JSON Web Key Set ID
+	//
+	// in: path
+	// required: true
+	Set string `json:"set"`
+
+	// JSON Web Key ID
+	//
+	// in: path
+	// required: true
+	KID string `json:"kid"`
+
+	// in: body
+	Body x.JSONWebKey
+}
+
+// swagger:route PUT /admin/keys/{set}/{kid} jwk setJsonWebKey
+//
+// # Set JSON Web Key
 //
 // Use this method if you do not want to let Hydra generate the JWKs for you, but instead save your own.
 //
+// Warning: the key is created or updated under the `kid` given in the request body. The `{kid}` path parameter exists for historical reasons only: it is ignored and not validated against the body.
+//
 // A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       200: JSONWebKey
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) UpdateKey(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//	Responses:
+//	  200: jsonWebKey
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-low
+func (h *Handler) adminUpdateJsonWebKey(w http.ResponseWriter, r *http.Request) {
 	var key jose.JSONWebKey
-	var set = ps.ByName("set")
+	// The {kid} path parameter is intentionally not read: it has never been
+	// validated against the body, and enforcing a match now would break clients
+	// that rely on the historic behavior.
+	set := r.PathValue("set")
 
 	if err := json.NewDecoder(r.Body).Decode(&key); err != nil {
-		h.r.Writer().WriteError(w, r, errorsx.WithStack(err))
+		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Unable to decode the request body: %s", err)))
 		return
 	}
 
-	if err := h.r.KeyManager().DeleteKey(r.Context(), set, key.KeyID); err != nil {
-		h.r.Writer().WriteError(w, r, err)
-		return
-	}
-
-	if err := h.r.KeyManager().AddKey(r.Context(), set, &key); err != nil {
+	if err := h.r.KeyManager().UpdateKey(r.Context(), set, &key); err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
@@ -308,29 +424,40 @@ func (h *Handler) UpdateKey(w http.ResponseWriter, r *http.Request, ps httproute
 	h.r.Writer().Write(w, r, key)
 }
 
-// swagger:route DELETE /keys/{set} admin deleteJsonWebKeySet
+// Delete JSON Web Key Set Parameters
 //
-// Delete a JSON Web Key Set
+// swagger:parameters deleteJsonWebKeySet
+type _ struct {
+	// The JSON Web Key Set
+	// in: path
+	// required: true
+	Set string `json:"set"`
+}
+
+// swagger:route DELETE /admin/keys/{set} jwk deleteJsonWebKeySet
+//
+// # Delete JSON Web Key Set
 //
 // Use this endpoint to delete a complete JSON Web Key Set and all the keys in that set.
 //
 // A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       204: emptyResponse
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) DeleteKeySet(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	var setName = ps.ByName("set")
+//	Responses:
+//	  204: emptyResponse
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-low
+func (h *Handler) adminDeleteJsonWebKeySet(w http.ResponseWriter, r *http.Request) {
+	setName := r.PathValue("set")
 
 	if err := h.r.KeyManager().DeleteKeySet(r.Context(), setName); err != nil {
 		h.r.Writer().WriteError(w, r, err)
@@ -340,30 +467,49 @@ func (h *Handler) DeleteKeySet(w http.ResponseWriter, r *http.Request, ps httpro
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// swagger:route DELETE /keys/{set}/{kid} admin deleteJsonWebKey
+// Delete JSON Web Key Parameters
 //
-// Delete a JSON Web Key
+// swagger:parameters deleteJsonWebKey
+type _ struct {
+	// The JSON Web Key Set
+	// in: path
+	// required: true
+	Set string `json:"set"`
+
+	// The JSON Web Key ID (kid)
+	//
+	// in: path
+	// required: true
+	KID string `json:"kid"`
+}
+
+// swagger:route DELETE /admin/keys/{set}/{kid} jwk deleteJsonWebKey
+//
+// # Delete JSON Web Key
 //
 // Use this endpoint to delete a single JSON Web Key.
 //
-// A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens), and allows storing user-defined keys as well.
+// A JSON Web Key (JWK) is a JavaScript Object Notation (JSON) data structure that represents a cryptographic key. A
+// JWK Set is a JSON data structure that represents a set of JWKs. A JSON Web Key is identified by its set and key id. ORY Hydra uses
+// this functionality to store cryptographic keys used for TLS and JSON Web Tokens (such as OpenID Connect ID tokens),
+// and allows storing user-defined keys as well.
 //
-//     Consumes:
-//     - application/json
+//	Consumes:
+//	- application/json
 //
-//     Produces:
-//     - application/json
+//	Produces:
+//	- application/json
 //
-//     Schemes: http, https
+//	Schemes: http, https
 //
-//     Responses:
-//       204: emptyResponse
-//       401: genericError
-//       403: genericError
-//       500: genericError
-func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	var setName = ps.ByName("set")
-	var keyName = ps.ByName("key")
+//	Responses:
+//	  204: emptyResponse
+//	  default: errorOAuth2
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: hydra-admin-low
+func (h *Handler) deleteJsonWebKey(w http.ResponseWriter, r *http.Request) {
+	setName, keyName := r.PathValue("set"), r.PathValue("kid")
 
 	if err := h.r.KeyManager().DeleteKey(r.Context(), setName, keyName); err != nil {
 		h.r.Writer().WriteError(w, r, err)
@@ -375,4 +521,4 @@ func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request, ps httproute
 
 // This function will not be called, OPTIONS request will be handled by cors
 // this is just a placeholder.
-func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {}
+func (h *Handler) handleOptions(http.ResponseWriter, *http.Request) {}
